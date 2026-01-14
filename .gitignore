@@ -44,3 +44,6 @@ next-env.d.ts
 tailwind.config.ts
 docker-compose.yaml
 Details.md
+
+.venv
+requirements.txt
