@@ -117,7 +117,7 @@ CREATE TABLE IF NOT EXISTS note_folders (
 
     -- Timestamps
     created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
+    updated_at TIMESTAMP DEFAULT NOW(),
     
     -- Constraints
     UNIQUE(user_id, name, parent_folder_id)

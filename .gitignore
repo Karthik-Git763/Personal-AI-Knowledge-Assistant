@@ -47,3 +47,6 @@ Details.md
 
 .venv
 requirements.txt
+start.bat
+start.sh
+Dockerfile

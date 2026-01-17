@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     POSTGRES_PASSWORD: str = "postgres"
     POSTGRES_HOST: str = "localhost"
     POSTGRES_PORT: int = 5432
-    POSTGRES_DB: str = "postgres"
+    POSTGRES_DB: str = "knowledge_assistant"
     
     DATABASE_URL: Optional[str] = None
     
@@ -60,7 +60,7 @@ class Settings(BaseSettings):
         if self.DATABASE_URL:
             return self.DATABASE_URL
         else:
-            return f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+            return f"postgresql+psycopg2://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
 
 settings = Settings()
 
