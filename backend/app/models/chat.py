@@ -1,5 +1,6 @@
 from enum import Enum
 from sqlmodel import Column, Field, Index, SQLModel, Relationship
+from sqlalchemy import desc
 from sqlalchemy.dialects.postgresql import JSONB
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -13,8 +14,9 @@ class TimestampMixin(SQLModel):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class ChatSession(TimestampMixin, SQLModel, table=True):
+    __tablename__ = "chat_sessions"
     __table_args__ = (
-        Index("ix_chat_session_user_last_message", "user_id", "last_message_at", postgresql_sort={"last_message_at": "DESC"} )
+        Index("ix_chat_session_user_last_message", "user_id", desc("last_message_at")),
     )
     id: int | None = Field(default=None, primary_key=True)
     user_id: int | None = Field(foreign_key="users.id", ondelete="CASCADE", nullable=False)
@@ -23,7 +25,7 @@ class ChatSession(TimestampMixin, SQLModel, table=True):
     is_archived: bool = Field(default=False)
     is_pinned: bool = Field(default=False)
     last_message_at: datetime = Field(default_factory=datetime.now)
-    
+
     # Relationships
     user: "User" = Relationship(back_populates="chat_sessions")
     messages: list["ChatMessages"] = Relationship(back_populates="session", sa_relationship_kwargs={
@@ -41,8 +43,9 @@ class ChatRole(str, Enum):
     system = "system"
 
 class ChatMessages(TimestampMixin, SQLModel, table=True):
+    __tablename__ = "chat_messages"
     __table_args__ = (
-        Index("ix_chat_messages_session_created", "session_id", "created_at", postgresql_sort={"created_at": "DESC"})
+        Index("ix_chat_messages_session_created", "session_id", desc("created_at")),
     )
     id: int | None = Field(default=None, primary_key=True)
     session_id: int | None = Field(foreign_key="chat_sessions.id", ondelete="CASCADE", nullable=False)
@@ -54,6 +57,6 @@ class ChatMessages(TimestampMixin, SQLModel, table=True):
     response_time_ms: int | None = Field(default=None)
     rating: int | None = Field(default=None)
     feedback: str | None = Field(default=None)
-    
+
     # Relationships
     session: ChatSession = Relationship(back_populates="messages")

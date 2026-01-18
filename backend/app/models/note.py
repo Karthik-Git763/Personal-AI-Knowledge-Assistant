@@ -1,8 +1,9 @@
-from sqlmodel import CheckConstraint, Enum, Field, Index, PrimaryKeyConstraint, SQLModel, Column, Relationship, UniqueConstraint, text, true
-from sqlalchemy import ARRAY, String
+from sqlmodel import CheckConstraint, Field, Index, PrimaryKeyConstraint, SQLModel, Column, Relationship, UniqueConstraint, text, true
+from enum import Enum
+from sqlalchemy import ARRAY, String, desc
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, List, Optional
-from chat import TimestampMixin
+from .chat import TimestampMixin
 
 if TYPE_CHECKING:
     from .user import User, UserSettings
@@ -11,8 +12,9 @@ if TYPE_CHECKING:
 
 
 class NoteFolders(TimestampMixin, SQLModel, table=True):
+    __tablename__ = "note_folders"
     __table_args__ = (
-        UniqueConstraint("user_id", "name", "parent_folder_id", name="uix_note_folders_user_name_parent_folder_id")
+        UniqueConstraint("user_id", "name", "parent_folder_id", name="uix_note_folders_user_name_parent_folder_id"),        
     )
     id: int | None = Field(default=None, primary_key=True)
     user_id: int | None = Field(foreign_key="users.id", ondelete="CASCADE", nullable=False, index=True)
@@ -45,19 +47,21 @@ class NoteFolders(TimestampMixin, SQLModel, table=True):
     user_settings: List["UserSettings"] = Relationship()
 
 class NoteTagRelations(SQLModel, table=True):
+    __tablename__ = "note_tag_relations"
     __table_args__ = (
-        PrimaryKeyConstraint("note_id", "tag_id")
+        PrimaryKeyConstraint("note_id", "tag_id"),
     )
     note_id: int = Field(foreign_key="notes.id", ondelete="CASCADE", primary_key=True, index=True)
     tag_id: int = Field(foreign_key="note_tags.id", ondelete="CASCADE", primary_key=True, index=True)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class Notes(TimestampMixin, SQLModel, table=True):
+    __tablename__ = "notes"
     __table_args__ = (
-        Index("ix_notes_favorite", "user_id", "updated_at", postgresql_sort={"updated_at": "DESC"}  , postgresql_where=true()),
-        Index("ix_notes_archived", "user_id", "updated_at", postgresql_sort={"updated_at": "DESC"}  , postgresql_where=true()),
+        Index("ix_notes_favorite", "user_id", "updated_at", desc("updated_at"), postgresql_where=true()),
+        Index("ix_notes_archived", "user_id", "updated_at", desc("updated_at"), postgresql_where=true()),
         Index("ix_notes_search", text("to_tsvector('english', coalesce(title, '') || ' ' || coalesce(content, ''))"), postgresql_using="gin"),
-        Index("ix_notes_full_search", text("to_tsvector('english', coalesce(title, '') || ' ' || coalesce(content, '') || ' ' || coalesce(summary, ''))"), postgresql_using="gin")
+        Index("ix_notes_full_search", text("to_tsvector('english', coalesce(title, '') || ' ' || coalesce(content, '') || ' ' || coalesce(summary, ''))"), postgresql_using="gin"),
     )
     id: int | None = Field(default=None, primary_key=True)
     user_id: int | None = Field(foreign_key="users.id", ondelete="CASCADE", nullable=False)
@@ -125,9 +129,10 @@ class Notes(TimestampMixin, SQLModel, table=True):
     )
 
 class NoteTags(SQLModel, table=True):
+    __tablename__ = "note_tags"
     __table_args__ = (
         Index("ix_note_tags_user_name", "user_id", "name", unique=True),
-        UniqueConstraint("user_id", "name", name="uix_note_tags_user_name")
+        UniqueConstraint("user_id", "name", name="uix_note_tags_user_name"),
     )
     id: int = Field(primary_key=True, default=None)
     user_id: int = Field(foreign_key="users.id", ondelete="CASCADE", nullable=False)
@@ -149,6 +154,7 @@ class NoteCategory(str, Enum):
     other = "other"
 
 class NoteTemplates(TimestampMixin, SQLModel, table=True):
+    __tablename__ = "note_templates"
     id: int | None = Field(primary_key=True, default=None)
     user_id: int | None = Field(default=None, foreign_key="users.id", ondelete="CASCADE")
     name: str = Field(nullable=False, max_length=255)
@@ -170,8 +176,9 @@ class NoteCollaboratorsPermission(str, Enum):
     comment = "comment"
 
 class NoteCollaborators(SQLModel, table=True):
+    __tablename__ = "note_collaborators"
     __table_args__ = (
-        UniqueConstraint("note_id", "user_id", name="unique_note_collaborators")
+        UniqueConstraint("note_id", "user_id", name="unique_note_collaborators"),
     )
     id: int | None = Field(primary_key=True, default=None)
     note_id: int | None = Field(foreign_key="notes.id", ondelete="CASCADE", nullable=False)
@@ -191,9 +198,10 @@ class NoteLinkType(str, Enum):
     child = "child"
 
 class NoteLinks(SQLModel, table=True):
+    __tablename__ = "note_links"
     __table_args__ = (
         CheckConstraint("source_note_id != target_note_id", name="check_note_links"),
-        UniqueConstraint("source_note_id", "target_note_id", name="unique_note_links")
+        UniqueConstraint("source_note_id", "target_note_id", name="unique_note_links"),
     )
     id: int | None = Field(primary_key=True, default=None)
     source_note_id: int | None = Field(foreign_key="notes.id", ondelete="CASCADE", nullable=False)

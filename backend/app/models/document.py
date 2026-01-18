@@ -1,8 +1,9 @@
-from sqlmodel import Enum, Index, SQLModel, Field, Column, Relationship, UniqueConstraint
+from sqlmodel import Index, SQLModel, Field, Column, Relationship, UniqueConstraint
+from enum import Enum
 from sqlalchemy import ARRAY, String, text
 from datetime import datetime
 from typing import TYPE_CHECKING
-from chat import TimestampMixin
+from .chat import TimestampMixin
 
 if TYPE_CHECKING:
     from .user import User
@@ -15,12 +16,13 @@ class DocumentStatus(str, Enum):
     deleted = "deleted"
 
 class Document(TimestampMixin, SQLModel, table=True):
+    __tablename__ = "documents"
     __table_args__ = (
         Index("ix_document_user_created", "user_id", "created_at"),
         Index("ix_documents_user_status", "user_id", "status"),
         Index("ix_document_search", text("to_tsvector('english', coalesce(title, '') || ' ' || coalesce(content, ''))"), postgresql_using="gin"),
         Index("ix_document_tags", "tags", postgresql_using="gin"),
-        Index("ix_document_full_text", text("to_tsvector('english', coalesce(title, '') || ' ' || coalesce(content, '') || ' ' || coalesce(summary, ''))"), postgresql_using="gin")
+        Index("ix_document_full_text", text("to_tsvector('english', coalesce(title, '') || ' ' || coalesce(content, '') || ' ' || coalesce(summary, ''))"), postgresql_using="gin"),
     )
     id: int | None = Field(default=None, primary_key=True)
     user_id: int | None = Field(foreign_key="users.id", ondelete="CASCADE", nullable=False)
@@ -62,9 +64,10 @@ class Document(TimestampMixin, SQLModel, table=True):
 
 
 class DocumentChunks(TimestampMixin, SQLModel, table=True):
+    __tablename__ = "document_chunks"
     __table_args__ = (
-        Index("ix_document_chunks_content_search", text("to_tsvector('english' content)"), postgresql_using='gin'),
-        UniqueConstraint("document_id", "chunk_index", name="uix_document_chunks")
+        Index("ix_document_chunks_content_search", text("to_tsvector('english', content)"), postgresql_using='gin'),
+        UniqueConstraint("document_id", "chunk_index", name="uix_document_chunks"),
     )
     id: int | None = Field(default=None, primary_key=True, index=True)
     document_id: int | None = Field(foreign_key="documents.id", ondelete="CASCADE", nullable=False)

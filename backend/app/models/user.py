@@ -1,9 +1,10 @@
+from enum import Enum
 from pydantic import EmailStr
-from sqlmodel import CheckConstraint, Column, Enum, Index, SQLModel, Field, Relationship
+from sqlmodel import CheckConstraint, Column, Index, SQLModel, Field, Relationship, desc
 from sqlalchemy.dialects.postgresql import JSONB
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional
-from chat import TimestampMixin
+from .chat import TimestampMixin
 
 if TYPE_CHECKING:
     from .note import Notes, NoteFolders, NoteTags, NoteTemplates, NoteCollaborators
@@ -11,12 +12,13 @@ if TYPE_CHECKING:
     from .chat import ChatSession
 
 class User(TimestampMixin, SQLModel, table=True):
+    __tablename__ = "users"
     __table_args__ = (
         Index("ix_user_email", "email", unique=True),
         Index("ix_users_created_at", "created_at")
     )
     id: int | None = Field(default=None, primary_key=True)
-    email: EmailStr = Field(unique=True, nullable=False, index=True, max_length=255)
+    email: EmailStr = Field(nullable=False, max_length=255)
     full_name: str = Field(nullable=False)
     hashed_password: str = Field(nullable=False, max_length=255)
     avatar_url: str | None = Field(default=None)
@@ -61,11 +63,12 @@ class LlmProvider(str, Enum):
     custom = "custom"
 
 class UserSettings(TimestampMixin, SQLModel, table=True):
+    __tablename__ = "user_settings"
     __table_args__ = (
         CheckConstraint("chunk_size >= 100 AND chunk_size <= 4000", name="chk_chunk_size"),
         CheckConstraint("chunk_overlap >= 0 AND chunk_overlap <= 1000", name="chk_chunk_overlap"),
         CheckConstraint("top_k_results >= 1 AND top_k_results <= 20", name="chk_top_k_results"),
-        CheckConstraint("similarity_threshold >= 0 AND similarity_threshold <= 1", name="chk_similarity_threshold"),
+        CheckConstraint("similarity_threshold >= 0 AND similarity_threshold <= 1", name="chk_similarity_threshold"),        
         CheckConstraint("temperature >= 0 AND temperature <= 1", name="chk_temperature"),
         CheckConstraint("max_tokens >= 100 AND max_tokens <= 4000", name="chk_max_tokens"),
     )
@@ -94,7 +97,7 @@ class UserSettings(TimestampMixin, SQLModel, table=True):
             "cascade": "all, delete-orphan"
         }
     )
-    
+
 class EntityType(str, Enum):
     note = "note"
     document = "document"
@@ -108,8 +111,9 @@ class ActivityAction(str, Enum):
     shared = "shared"
 
 class ActivityLogs(SQLModel, table=True):
+    __tablename__ = "activitylogs"
     __table_args__ = (
-        Index("ix_activity_logs_user_created", "user_id", "created_at", postgresql_sort={"created_at": "DESC"}),
+        Index("ix_activity_logs_user_created", "user_id", desc("created_at")),
         Index("ix_activity_logs_entity", "entity_type", "entity_id")
     )
     
