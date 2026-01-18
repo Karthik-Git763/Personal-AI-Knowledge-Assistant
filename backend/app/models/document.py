@@ -1,44 +1,64 @@
-from sqlmodel import ARRAY, TIMESTAMP, Index, SQLModel, Field, Relationship
-from uuid import uuid4, UUID
+from sqlmodel import SQLModel, Field, Column, Relationship
+from sqlalchemy import ARRAY, String
+from datetime import datetime
+from typing import TYPE_CHECKING
+from chat import TimestampMixin
 
-from sqlmodel.main import datetime
+if TYPE_CHECKING:
+    from .user import User
+    from .note import Notes
 
-class Document(SQLModel, table=True):
-    id: UUID = Field(default_factory=uuid4, primary_key=True)
-    user_id: UUID = Field(foreign_key="user.id", index=True)
-    title: str = Field(nullable=False, index=True)
-    file_name: str = Field(nullable=False, index=True)
+class Document(TimestampMixin, SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    user_id: int | None = Field(foreign_key="users.id", ondelete="CASCADE", nullable=False, index=True)
+    title: str = Field(nullable=False, index=True, max_length=255)
+    file_name: str = Field(nullable=False, max_length=255)
     file_path: str = Field(nullable=False)
     file_size: int = Field(nullable=False)
-    file_type: str = Field(nullable=False)
-    mime_type: str = Field(nullable=False)
-    content: str = Field(default="")
-    content_preview: str = Field(default="")
-    summary: ARRAY[str] = Field(default_factory=list)
-    keywords: ARRAY[str] = Field(default_factory=list)
-    tags: ARRAY[str] = Field(default_factory=list)
+    file_type: str = Field(nullable=False, max_length=255)
+    mime_type: str = Field(nullable=False, max_length=255)
+    is_deleted: bool = Field(default=False)
+    content: str | None = Field(default=None)
+    content_preview: str | None = Field(default=None)
+    summary: str | None = Field(default=None)  # TEXT not ARRAY
+    keywords: list[str] = Field(default_factory=list, sa_column=Column(ARRAY(String)))
+    tags: list[str] = Field(default_factory=list, sa_column=Column(ARRAY(String)))
     language: str = Field(default="en", max_length=10)
     status: str = Field(default="processing", max_length=50)
-    processing_started_at: TIMESTAMP = Field(default=None)
-    processing_completed_at: TIMESTAMP = Field(default=None)
-    processing_error: str = Field(default=None)
-    word_count: int = Field(default=None)
-    page_count: int = Field(default=None)
+    processing_started_at: datetime | None = Field(default=None)
+    processing_completed_at: datetime | None = Field(default=None)
+    processing_error: str | None = Field(default=None)
+    word_count: int | None = Field(default=None)
+    page_count: int | None = Field(default=None)
     chunk_count: int = Field(default=0)
-    created_at: TIMESTAMP = Field(default=datetime.now, index=True)
-    updated_at: TIMESTAMP = Field(default=datetime.now)
-    last_accessed_at: TIMESTAMP = Field(default=None)
+    last_accessed_at: datetime = Field(default_factory=datetime.now)
+    
+    # Relationships
+    user: "User" = Relationship(back_populates="documents")
+    chunks: list["DocumentChunks"] = Relationship(
+        back_populates="document",
+        sa_relationship_kwargs={
+            "cascade": "all, delete-orphan",
+            "order_by": "DocumentChunks.chunk_index"
+        }
+    )
+    linked_notes: list["Notes"] = Relationship(
+        back_populates="linked_document",
+        sa_relationship_kwargs={"foreign_keys": "[Notes.linked_document_id]"}
+    )
 
 
-class DocumentChunks(SQLModel, table=True):
-    id: UUID = Field(default_factory=uuid4, primary_key=True)
-    document_id: UUID = Field(foreign_key="document.id", ondelete="CASCADE", unique=True)
-    chunk_index: int = Field(default=0, unique=True)
-    content: str = Field(default="")
-    content_hash: str
-    vector_id: str
-    token_count: int
-    char_count: int
-    page_number: int
-    section_title: str
-    created_at: TIMESTAMP = Field(default=datetime.now)
+class DocumentChunks(TimestampMixin, SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    document_id: int | None = Field(foreign_key="documents.id", ondelete="CASCADE", nullable=False)
+    chunk_index: int | None = Field(nullable=False)
+    content: str = Field(nullable=False)
+    content_hash: str | None = Field(default=None, max_length=255)
+    vector_id: str = Field(nullable=False)
+    token_count: int | None = Field(default=None)
+    char_count: int | None = Field(default=None)
+    page_number: int | None = Field(default=None)
+    section_title: str | None = Field(default=None, max_length=255)
+    
+    # Relationships
+    document: Document = Relationship(back_populates="chunks")
