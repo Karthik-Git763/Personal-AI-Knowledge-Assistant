@@ -50,3 +50,4 @@ requirements.txt
 start.bat
 start.sh
 Dockerfile
+__pycache__
