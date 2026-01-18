@@ -282,7 +282,7 @@ CREATE TABLE IF NOT EXISTS user_settings (
     similarity_threshold FLOAT DEFAULT 0.7 CHECK (similarity_threshold >= 0 AND similarity_threshold <= 1),
     
     -- LLM Parameters
-    temperature FLOAT DEFAULT 0.7 CHECK (temperature >= 0 AND temperature <= 2),
+    temperature FLOAT DEFAULT 0.7 CHECK (temperature >= 0 AND temperature <= 1),
     max_tokens INTEGER DEFAULT 1000 CHECK (max_tokens >= 100 AND max_tokens <= 4000),
     
     -- UI Preferences

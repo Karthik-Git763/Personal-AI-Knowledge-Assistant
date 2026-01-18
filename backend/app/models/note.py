@@ -1,4 +1,4 @@
-from sqlmodel import Field, SQLModel, Column, Relationship
+from sqlmodel import CheckConstraint, Enum, Field, Index, PrimaryKeyConstraint, SQLModel, Column, Relationship, UniqueConstraint, text, true
 from sqlalchemy import ARRAY, String
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, List, Optional
@@ -11,11 +11,14 @@ if TYPE_CHECKING:
 
 
 class NoteFolders(TimestampMixin, SQLModel, table=True):
+    __table_args__ = (
+        UniqueConstraint("user_id", "name", "parent_folder_id", name="uix_note_folders_user_name_parent_folder_id")
+    )
     id: int | None = Field(default=None, primary_key=True)
-    user_id: int | None = Field(foreign_key="users.id", ondelete="CASCADE", nullable=False)
+    user_id: int | None = Field(foreign_key="users.id", ondelete="CASCADE", nullable=False, index=True)
     name: str = Field(max_length=255)
     description: str | None = Field(default=None)
-    parent_folder_id: int | None = Field(default=None, foreign_key="note_folders.id", ondelete="CASCADE")
+    parent_folder_id: int | None = Field(default=None, foreign_key="note_folders.id", ondelete="CASCADE", index=True)
     color: str | None = Field(default=None, max_length=20)
     icon: str | None = Field(default=None, max_length=50)
     emoji: str | None = Field(default=None, max_length=10)
@@ -42,18 +45,27 @@ class NoteFolders(TimestampMixin, SQLModel, table=True):
     user_settings: List["UserSettings"] = Relationship()
 
 class NoteTagRelations(SQLModel, table=True):
-    note_id: int = Field(foreign_key="notes.id", ondelete="CASCADE", primary_key=True)
-    tag_id: int = Field(foreign_key="note_tags.id", ondelete="CASCADE", primary_key=True)
+    __table_args__ = (
+        PrimaryKeyConstraint("note_id", "tag_id")
+    )
+    note_id: int = Field(foreign_key="notes.id", ondelete="CASCADE", primary_key=True, index=True)
+    tag_id: int = Field(foreign_key="note_tags.id", ondelete="CASCADE", primary_key=True, index=True)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class Notes(TimestampMixin, SQLModel, table=True):
+    __table_args__ = (
+        Index("ix_notes_favorite", "user_id", "updated_at", postgresql_sort={"updated_at": "DESC"}  , postgresql_where=true()),
+        Index("ix_notes_archived", "user_id", "updated_at", postgresql_sort={"updated_at": "DESC"}  , postgresql_where=true()),
+        Index("ix_notes_search", text("to_tsvector('english', coalesce(title, '') || ' ' || coalesce(content, ''))"), postgresql_using="gin"),
+        Index("ix_notes_full_search", text("to_tsvector('english', coalesce(title, '') || ' ' || coalesce(content, '') || ' ' || coalesce(summary, ''))"), postgresql_using="gin")
+    )
     id: int | None = Field(default=None, primary_key=True)
     user_id: int | None = Field(foreign_key="users.id", ondelete="CASCADE", nullable=False)
-    folder_id: int | None = Field(default=None, foreign_key="note_folders.id", ondelete="SET NULL")
+    folder_id: int | None = Field(default=None, foreign_key="note_folders.id", ondelete="SET NULL", index=True)
     title: str = Field(nullable=False, max_length=500)
     content: str = Field(nullable=False)
     content_type: str = Field(default="markdown", max_length=20)
-    content_preview: str | None = Field(default=None)
+    content_preview: str | None = Field(default=None, max_length=200)
     summary: str | None = Field(default=None)
     keywords: list[str] = Field(default_factory=list, sa_column=Column(ARRAY(String)))
     ai_generated: bool = Field(default=False)
@@ -62,8 +74,8 @@ class Notes(TimestampMixin, SQLModel, table=True):
     is_pinned: bool = Field(default=False)
     color: str | None = Field(default=None, max_length=20)
     emoji: str | None = Field(default=None, max_length=10)
-    linked_document_id: int | None = Field(default=None, foreign_key="documents.id", ondelete="SET NULL")
-    linked_chat_session_id: int | None = Field(default=None, foreign_key="chat_sessions.id", ondelete="SET NULL")
+    linked_document_id: int | None = Field(default=None, foreign_key="documents.id", ondelete="SET NULL", index=True)
+    linked_chat_session_id: int | None = Field(default=None, foreign_key="chat_sessions.id", ondelete="SET NULL", index=True)
     parent_note_id: int | None = Field(default=None, foreign_key="notes.id", ondelete="SET NULL")
     version: int = Field(default=1)
     previous_version_id: int | None = Field(default=None, foreign_key="notes.id", ondelete="SET NULL")
@@ -113,6 +125,10 @@ class Notes(TimestampMixin, SQLModel, table=True):
     )
 
 class NoteTags(SQLModel, table=True):
+    __table_args__ = (
+        Index("ix_note_tags_user_name", "user_id", "name", unique=True),
+        UniqueConstraint("user_id", "name", name="uix_note_tags_user_name")
+    )
     id: int = Field(primary_key=True, default=None)
     user_id: int = Field(foreign_key="users.id", ondelete="CASCADE", nullable=False)
     name: str = Field(nullable=False, max_length=100)
@@ -124,12 +140,20 @@ class NoteTags(SQLModel, table=True):
     user: "User" = Relationship(back_populates="tags")
     notes: list["Notes"] = Relationship(back_populates="tags", link_model=NoteTagRelations)
     
+class NoteCategory(str, Enum):
+    personal = "personal"
+    meeting = "meeting"
+    work = "work"
+    study = "study"
+    research = "research"
+    other = "other"
+
 class NoteTemplates(TimestampMixin, SQLModel, table=True):
     id: int | None = Field(primary_key=True, default=None)
     user_id: int | None = Field(default=None, foreign_key="users.id", ondelete="CASCADE")
     name: str = Field(nullable=False, max_length=255)
     description: str | None = Field(default=None)
-    category: str | None = Field(default=None, max_length=100)
+    category: NoteCategory = Field(default=None)
     content: str = Field(nullable=False)
     content_type: str = Field(default="markdown", max_length=20)
     is_public: bool = Field(default=False)
@@ -138,12 +162,21 @@ class NoteTemplates(TimestampMixin, SQLModel, table=True):
     
     # Relationships
     user: Optional["User"] = Relationship(back_populates="templates")
-    
+
+class NoteCollaboratorsPermission(str, Enum):
+    view = "view"
+    edit = "edit"
+    admin = "admin"
+    comment = "comment"
+
 class NoteCollaborators(SQLModel, table=True):
+    __table_args__ = (
+        UniqueConstraint("note_id", "user_id", name="unique_note_collaborators")
+    )
     id: int | None = Field(primary_key=True, default=None)
     note_id: int | None = Field(foreign_key="notes.id", ondelete="CASCADE", nullable=False)
     user_id: int | None = Field(foreign_key="users.id", ondelete="CASCADE", nullable=False)
-    permission: str = Field(default="view", max_length=20)
+    permission: NoteCollaboratorsPermission = Field(default=NoteCollaboratorsPermission.view)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     accepted_at: datetime | None = Field(default=None)
     
@@ -151,11 +184,21 @@ class NoteCollaborators(SQLModel, table=True):
     note: Notes = Relationship(back_populates="collaborators")
     user: "User" = Relationship(back_populates="note_collaborations")
     
+class NoteLinkType(str, Enum):
+    related = "related"
+    referenced = "referenced"
+    parent = "parent"
+    child = "child"
+
 class NoteLinks(SQLModel, table=True):
+    __table_args__ = (
+        CheckConstraint("source_note_id != target_note_id", name="check_note_links"),
+        UniqueConstraint("source_note_id", "target_note_id", name="unique_note_links")
+    )
     id: int | None = Field(primary_key=True, default=None)
     source_note_id: int | None = Field(foreign_key="notes.id", ondelete="CASCADE", nullable=False)
     target_note_id: int | None = Field(foreign_key="notes.id", ondelete="CASCADE", nullable=False)
-    link_type: str = Field(default="related", max_length=50)
+    link_type: NoteLinkType = Field(default=NoteLinkType.related)
     description: str | None = Field(default=None)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     

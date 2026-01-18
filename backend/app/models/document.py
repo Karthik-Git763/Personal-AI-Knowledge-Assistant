@@ -1,5 +1,5 @@
-from sqlmodel import SQLModel, Field, Column, Relationship
-from sqlalchemy import ARRAY, String
+from sqlmodel import Enum, Index, SQLModel, Field, Column, Relationship, UniqueConstraint
+from sqlalchemy import ARRAY, String, text
 from datetime import datetime
 from typing import TYPE_CHECKING
 from chat import TimestampMixin
@@ -8,18 +8,31 @@ if TYPE_CHECKING:
     from .user import User
     from .note import Notes
 
+class DocumentStatus(str, Enum):
+    processing = "processing"
+    completed = "completed"
+    failed = "failed"
+    deleted = "deleted"
+
 class Document(TimestampMixin, SQLModel, table=True):
+    __table_args__ = (
+        Index("ix_document_user_created", "user_id", "created_at"),
+        Index("ix_documents_user_status", "user_id", "status"),
+        Index("ix_document_search", text("to_tsvector('english', coalesce(title, '') || ' ' || coalesce(content, ''))"), postgresql_using="gin"),
+        Index("ix_document_tags", "tags", postgresql_using="gin"),
+        Index("ix_document_full_text", text("to_tsvector('english', coalesce(title, '') || ' ' || coalesce(content, '') || ' ' || coalesce(summary, ''))"), postgresql_using="gin")
+    )
     id: int | None = Field(default=None, primary_key=True)
-    user_id: int | None = Field(foreign_key="users.id", ondelete="CASCADE", nullable=False, index=True)
-    title: str = Field(nullable=False, index=True, max_length=255)
+    user_id: int | None = Field(foreign_key="users.id", ondelete="CASCADE", nullable=False)
+    title: str = Field(nullable=False, max_length=255)
     file_name: str = Field(nullable=False, max_length=255)
     file_path: str = Field(nullable=False)
     file_size: int = Field(nullable=False)
-    file_type: str = Field(nullable=False, max_length=255)
+    file_type: str = Field(nullable=False, max_length=255, index=True)
     mime_type: str = Field(nullable=False, max_length=255)
     is_deleted: bool = Field(default=False)
     content: str | None = Field(default=None)
-    content_preview: str | None = Field(default=None)
+    content_preview: str | None = Field(default=None, max_length=500)
     summary: str | None = Field(default=None)  # TEXT not ARRAY
     keywords: list[str] = Field(default_factory=list, sa_column=Column(ARRAY(String)))
     tags: list[str] = Field(default_factory=list, sa_column=Column(ARRAY(String)))
@@ -49,12 +62,16 @@ class Document(TimestampMixin, SQLModel, table=True):
 
 
 class DocumentChunks(TimestampMixin, SQLModel, table=True):
-    id: int | None = Field(default=None, primary_key=True)
+    __table_args__ = (
+        Index("ix_document_chunks_content_search", text("to_tsvector('english' content)"), postgresql_using='gin'),
+        UniqueConstraint("document_id", "chunk_index", name="uix_document_chunks")
+    )
+    id: int | None = Field(default=None, primary_key=True, index=True)
     document_id: int | None = Field(foreign_key="documents.id", ondelete="CASCADE", nullable=False)
     chunk_index: int | None = Field(nullable=False)
     content: str = Field(nullable=False)
     content_hash: str | None = Field(default=None, max_length=255)
-    vector_id: str = Field(nullable=False)
+    vector_id: str = Field(nullable=False, index=True)
     token_count: int | None = Field(default=None)
     char_count: int | None = Field(default=None)
     page_number: int | None = Field(default=None)

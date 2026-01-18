@@ -1,5 +1,5 @@
 from enum import Enum
-from sqlmodel import Column, Field, SQLModel, Relationship
+from sqlmodel import Column, Field, Index, SQLModel, Relationship
 from sqlalchemy.dialects.postgresql import JSONB
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -12,7 +12,10 @@ class TimestampMixin(SQLModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
-class ChatSession(TimestampMixin, SQLModel, table=True):    
+class ChatSession(TimestampMixin, SQLModel, table=True):
+    __table_args__ = (
+        Index("ix_chat_session_user_last_message", "user_id", "last_message_at", postgresql_sort={"last_message_at": "DESC"} )
+    )
     id: int | None = Field(default=None, primary_key=True)
     user_id: int | None = Field(foreign_key="users.id", ondelete="CASCADE", nullable=False)
     title: str | None = Field(default=None, max_length=255)
@@ -38,6 +41,9 @@ class ChatRole(str, Enum):
     system = "system"
 
 class ChatMessages(TimestampMixin, SQLModel, table=True):
+    __table_args__ = (
+        Index("ix_chat_messages_session_created", "session_id", "created_at", postgresql_sort={"created_at": "DESC"})
+    )
     id: int | None = Field(default=None, primary_key=True)
     session_id: int | None = Field(foreign_key="chat_sessions.id", ondelete="CASCADE", nullable=False)
     role: ChatRole = Field(nullable=False, max_length=20)
