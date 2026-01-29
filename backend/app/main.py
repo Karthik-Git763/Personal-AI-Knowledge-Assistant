@@ -1,7 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.config import settings
-from app.database import create_db_and_tables
+from backend.app.config import settings
+from backend.app.database import create_db_and_tables
+from backend.app.api import auth, chat, documents, notes, search
 
 # Create FastAPI app
 app = FastAPI(
@@ -39,8 +40,6 @@ def read_root():
 def health_check():
     return {"status": "healthy"}
 
-# Import and include routers (if you have them)
-# from app.api import auth, chat, documents, notes, search
 # app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 # app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 # app.include_router(documents.router, prefix="/api/documents", tags=["documents"])

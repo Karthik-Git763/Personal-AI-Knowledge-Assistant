@@ -46,6 +46,7 @@ docker-compose.yaml
 Details.md
 
 .venv
+venv
 requirements.txt
 start.bat
 start.sh
