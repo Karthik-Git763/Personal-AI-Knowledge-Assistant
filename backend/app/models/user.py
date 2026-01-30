@@ -11,20 +11,46 @@ if TYPE_CHECKING:
     from .document import Document
     from .chat import ChatSession
 
-class User(TimestampMixin, SQLModel, table=True):
+# Shared property
+class UserBase(SQLModel):
+    email: EmailStr = Field(unique=True, index=True, max_length=255)
+    is_active: bool = True
+    is_superuser: bool = False
+    full_name: str | None = Field(default=None, max_length=255)
+
+# Creation API properties
+class UserCreate(UserBase):
+    password: str = Field(min_length=8, max_length=128)
+    
+class UserRegister(SQLModel):
+    email: EmailStr = Field(max_length=255)
+    password: str = Field(min_length=8, max_length=128)
+    full_name: str | None = Field(default=None, max_length=255)
+
+# Update API properties | Optional
+class UserUpdate(UserBase):
+    emai: EmailStr | None = Field(default=None, max_length=255)
+    password: str | None = Field(default=None, min_length=8, max_length=128)
+    
+class UserUpdateMe(SQLModel):
+    full_name: str | None = Field(default=None, max_length=255)
+    email: EmailStr | None = Field(default=None, max_length=255)
+    
+class UpdatePassword(SQLModel):
+    current_password: str = Field(min_length=8, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+    
+# Table User
+class User(TimestampMixin, UserBase, SQLModel, table=True):
     __tablename__ = "users"
     __table_args__ = (
         Index("ix_user_email", "email", unique=True),
         Index("ix_users_created_at", "created_at")
     )
     id: int | None = Field(default=None, primary_key=True)
-    email: EmailStr = Field(nullable=False, max_length=255)
-    full_name: str = Field(nullable=False)
     hashed_password: str = Field(nullable=False, max_length=255)
     avatar_url: str | None = Field(default=None)
 
-    is_active: bool = Field(default=True)
-    is_superuser: bool = Field(default=False)
     is_verified: bool = Field(default=False)
     is_deleted: bool = Field(default=False)
     last_login_at: datetime | None = Field(default=None)
@@ -44,6 +70,14 @@ class User(TimestampMixin, SQLModel, table=True):
     chat_sessions: list["ChatSession"] = Relationship(back_populates="user")
     activity_logs: list["ActivityLogs"] = Relationship(back_populates="user")
     note_collaborations: list["NoteCollaborators"] = Relationship(back_populates="user")
+
+class UserPublic(UserBase):
+    id: int
+    created_at: datetime | None = None
+    
+class UsersPublic(SQLModel):
+    data: list[UserPublic]
+    count: int
 
 class UserTheme(str, Enum):
     light = "light"
@@ -129,3 +163,16 @@ class ActivityLogs(SQLModel, table=True):
     
     # Relationships
     user: User = Relationship(back_populates="activity_logs")
+    
+    class Message(SQLModel):
+        message: str
+        
+    class Token(SQLModel):
+        access_token: str
+    
+    class TokenPayload(SQLModel):
+        sub: str | None = None
+        
+    class NewPassword(SQLModel):
+        token: str
+        new_password: str = Field(min_length=8, max_length=128)
