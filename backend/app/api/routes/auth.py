@@ -1,55 +1,46 @@
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, EmailStr
-from sqlmodel import Session, select, col, delete, func
-from backend.app.models.user import User
-from passlib.context import CryptContext
-from datetime import datetime, timedelta
-from typing import Optional, Any
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from jose import JWTError, jwt
+from datetime import timedelta
+from typing import Annotated, Any
 
-SECRET_KEY = "b40c2b07bda1ff49aaf7faa27caceafc129a67f7ea72a8927ee6cef1cec5faca"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.security import OAuth2PasswordRequestForm
+from app.core import security
+from app.core.config import settings
+from backend.app import crud
+from app.api.deps import CurrentUser, SessionDep, get_current_active_superuser
+from app.models.user import Message, Token, UserPublic
 
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-    
-class TokenData(BaseModel):
-    username: Optional[str] = None
-    
-password_context = CryptContext(schemes=['bcrypt'], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+router = APIRouter(tags=["login"])
 
-router = APIRouter()
+@router.post(path="/login/access-token")
+def login_access_token(
+        session: SessionDep, form_data: Annotated[OAuth2PasswordRequestForm, Depends()]
+    ) -> Token:
+    """
+        OAuth2 token login, get an access token for future requests
+    """
+    user = crud.authenticate(
+        session=session, email=form_data.username, password=form_data.password
+    )
+    if not user
+        raise HTTPException(status_code=400, detail="Incorrect Email or Password")
+    elif not user.is_active:
+        raise HTTPException(status_code=400, detail="Inactive user")
+    access_token_expires: timedelta = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    return Token(
+        access_token=security.create_access_token(
+            subject=user.id, expires_delta=access_token_expires
+        )
+    )
 
-class RegisterIn(BaseModel):
-    email: EmailStr
-    full_name: str
-    password: str
-    
-class LoginIn(BaseModel):
-    email: EmailStr
-    password: str
-
-def verify_password(plain_password, hashed_password):
-    return password_context.verify(plain_password, hashed_password)
-    
-def get_password_hash(password):
-    return password_context.hash(password)
-    
-async def get_user(username: str):
-    query = User.select().where(User.c)
-
-@router.post("/register", status_code=201)
-def register(payload: RegisterIn, session: Session = Depends()):
-    existing = session.exec(select(User).where(User.email == payload.email))
-    if existing:
-       raise HTTPException(status_code=400, detail="Email already registered")
-    hashed = password_context.hash(payload.password)
-    user = User(email=payload.email, full_name=payload.full_name, hashed_password=hashed)
-    session.add(user)
-    session.commit()
-    session.refresh(user)
-    return {"id": user.id, "email": user.email, "full_name": user.full_name}
+@router.post(path="/login/test-token", response_model=UserPublic)
+def test_token(current_user: CurrentUser) -> Any:
+    return current_user
+#
+# @router.post(path="/password-recovery/{email}")
+# def recover_password(email: str, session: SessionDep) -> Message:
+#     """    
+#     Password Recovery
+#     """
+#     user = crud.get_user_by_email(session=session, email=email)
+#     if user:
+#         password_reset_token
