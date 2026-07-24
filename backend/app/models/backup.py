@@ -1,9 +1,11 @@
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar
+from uuid import UUID, uuid4
 
 from sqlalchemy import DateTime, LargeBinary, String
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlmodel import Column, Field, Index, Relationship, SQLModel
 
 from app.utils.sanitization import sanitize_plain_text
@@ -20,7 +22,8 @@ def sanitize_backup_failure_message(value: str | None) -> str | None:
 
 class BackupStatus(StrEnum):
     pending = "pending"
-    running = "running"
+    exporting = "exporting"
+    uploading = "uploading"
     completed = "completed"
     failed = "failed"
 
@@ -33,6 +36,7 @@ class BackupTrigger(StrEnum):
 class DriveConnectionStatus(StrEnum):
     connected = "connected"
     disconnected = "disconnected"
+    reauthorization_required = "reauthorization_required"
     failed = "failed"
 
 
@@ -50,7 +54,7 @@ class GoogleDriveConnection(TimestampMixin, SQLModel, table=True):
     google_email: str = Field(nullable=False, max_length=255)
     granted_scopes: list[str] = Field(default_factory=list, sa_column=Column(JSONB, nullable=False))
     status: DriveConnectionStatus = Field(
-        default=DriveConnectionStatus.connected, sa_column=Column(String(20), nullable=False)
+        default=DriveConnectionStatus.connected, sa_column=Column(String(32), nullable=False)
     )
     connected_at: datetime = Field(
         default_factory=lambda: datetime.now(UTC),
@@ -93,6 +97,10 @@ class WorkspaceBackup(TimestampMixin, SQLModel, table=True):
     )
 
     id: int | None = Field(default=None, primary_key=True)
+    backup_id: UUID = Field(
+        default_factory=uuid4,
+        sa_column=Column(PGUUID(as_uuid=True), nullable=False, unique=True, index=True),
+    )
     user_id: int = Field(foreign_key="users.id", nullable=False, index=True)
     remote_file_id: str | None = Field(default=None, max_length=255, index=True)
     status: BackupStatus = Field(default=BackupStatus.pending, sa_column=Column(String(20), nullable=False))

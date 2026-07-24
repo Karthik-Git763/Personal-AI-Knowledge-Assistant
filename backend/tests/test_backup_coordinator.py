@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -24,9 +25,15 @@ from app.services.google_drive_store import GoogleDriveReauthorizationRequiredEr
 
 
 class RecordingExporter:
-    def __init__(self, now: datetime, failure: Exception | None = None) -> None:
+    def __init__(
+        self,
+        now: datetime,
+        failure: Exception | None = None,
+        manifest_owner_id: UUID | None = None,
+    ) -> None:
         self.now = now
         self.failure = failure
+        self.manifest_owner_id = manifest_owner_id
 
     def export(self, user: User, destination: Path) -> BackupExportResult:
         if self.failure is not None:
@@ -35,7 +42,7 @@ class RecordingExporter:
         manifest = BackupManifestV1(
             schema_version=1,
             backup_id=uuid4(),
-            owner_id=user.portable_id,
+            owner_id=self.manifest_owner_id or user.portable_id,
             created_at=self.now,
             app_version="test",
             counts={"notes": 2},
@@ -57,10 +64,12 @@ class RecordingStore:
         failure: Exception | None = None,
         mismatch: bool = False,
         fail_retention: bool = False,
+        list_failure: BaseException | None = None,
     ) -> None:
         self.failure = failure
         self.mismatch = mismatch
         self.fail_retention = fail_retention
+        self.list_failure = list_failure
         self.backups: list[StoredBackup] = []
         self.deleted: list[str] = []
 
@@ -92,6 +101,8 @@ class RecordingStore:
         return stored
 
     async def list(self, owner_id: UUID) -> list[StoredBackup]:
+        if self.list_failure is not None:
+            raise self.list_failure
         return list(self.backups)
 
     async def download(self, remote_id: str, destination: Path) -> Path:
@@ -119,6 +130,34 @@ class LifecycleStore(RecordingStore):
         ).one()
         self.status_during_upload = backup.status
         return await super().upload(archive, metadata)
+
+
+class LifecycleExporter(RecordingExporter):
+    def __init__(self, now: datetime, session: Session, user_id: int) -> None:
+        super().__init__(now)
+        self.session = session
+        self.user_id = user_id
+        self.status_during_export: BackupStatus | str | None = None
+
+    def export(self, user: User, destination: Path) -> BackupExportResult:
+        backup = self.session.exec(
+            select(WorkspaceBackup)
+            .where(WorkspaceBackup.user_id == self.user_id)
+            .order_by(col(WorkspaceBackup.id).desc())
+        ).one()
+        self.status_during_export = backup.status
+        return super().export(user, destination)
+
+
+class BlockingStore(RecordingStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+
+    async def upload(self, archive: Path, metadata: BackupObjectMetadata) -> StoredBackup:
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("upload should be cancelled")
 
 
 @pytest.fixture
@@ -152,10 +191,12 @@ def _coordinator(
     store: RecordingStore,
     *,
     exporter_failure: Exception | None = None,
+    exporter: RecordingExporter | None = None,
 ) -> BackupCoordinator:
+    configured_exporter = exporter or RecordingExporter(now, exporter_failure)
     return BackupCoordinator(
         session_factory=lambda: session,
-        exporter_factory=lambda session: RecordingExporter(now, exporter_failure),
+        exporter_factory=lambda session: configured_exporter,
         store_factory=lambda session, user, connection: store,
         clock=lambda: now,
         temporary_directory=tmp_path / "backup-temp",
@@ -186,19 +227,21 @@ async def test_successful_backup_commits_verified_metadata_and_schedule(
 
 
 @pytest.mark.asyncio
-async def test_backup_transitions_from_pending_to_running_before_completion(
+async def test_backup_persists_exporting_and_uploading_transitions_before_completion(
     session: Session, tmp_path: Path, backup_workspace: tuple[User, GoogleDriveConnection, BackupSchedule]
 ) -> None:
     user, _, _ = backup_workspace
     now = datetime(2026, 7, 24, 13, 0, tzinfo=UTC)
     store = LifecycleStore(session, user.id)  # type: ignore[arg-type]
-    coordinator = _coordinator(session, tmp_path, now, store)
+    exporter = LifecycleExporter(now, session, user.id)  # type: ignore[arg-type]
+    coordinator = _coordinator(session, tmp_path, now, store, exporter=exporter)
 
     pending = coordinator.start_backup(user.id, BackupTrigger.manual)  # type: ignore[arg-type]
-    result = await coordinator.run_backup(pending.id)  # type: ignore[arg-type]
+    result = await coordinator.run_backup(pending.backup_id)
 
     assert pending.status == BackupStatus.pending
-    assert store.status_during_upload == BackupStatus.running
+    assert exporter.status_during_export == BackupStatus.exporting
+    assert store.status_during_upload == BackupStatus.uploading
     assert result.status == BackupStatus.completed
     assert result.started_at == now
 
@@ -337,6 +380,52 @@ async def test_retention_failure_keeps_completed_backup_and_sanitizes_warning(
 
 
 @pytest.mark.asyncio
+async def test_retention_list_failure_keeps_completed_backup_and_schedule_success(
+    session: Session, tmp_path: Path, backup_workspace: tuple[User, GoogleDriveConnection, BackupSchedule]
+) -> None:
+    user, _, schedule = backup_workspace
+    now = datetime(2026, 7, 24, 13, 0, tzinfo=UTC)
+    coordinator = _coordinator(
+        session,
+        tmp_path,
+        now,
+        RecordingStore(list_failure=RuntimeError("provider response: refresh-token-secret")),
+    )
+
+    result = await coordinator.run_backup_for_user(user.id, BackupTrigger.manual)  # type: ignore[arg-type]
+
+    assert result.status == BackupStatus.completed
+    assert result.failure_message == "Backup retention cleanup failed"
+    session.refresh(schedule)
+    assert schedule.last_success_at == now
+    assert schedule.next_due_at == now + timedelta(hours=24)
+
+
+@pytest.mark.asyncio
+async def test_retention_cancellation_keeps_completed_backup_and_schedule_success(
+    session: Session, tmp_path: Path, backup_workspace: tuple[User, GoogleDriveConnection, BackupSchedule]
+) -> None:
+    user, _, schedule = backup_workspace
+    now = datetime(2026, 7, 24, 13, 0, tzinfo=UTC)
+    coordinator = _coordinator(
+        session,
+        tmp_path,
+        now,
+        RecordingStore(list_failure=asyncio.CancelledError()),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await coordinator.run_backup_for_user(user.id, BackupTrigger.manual)  # type: ignore[arg-type]
+
+    backup = session.exec(select(WorkspaceBackup).where(WorkspaceBackup.user_id == user.id)).one()
+    assert backup.status == BackupStatus.completed
+    assert backup.failure_message == "Backup retention cleanup failed"
+    session.refresh(schedule)
+    assert schedule.last_success_at == now
+    assert schedule.next_due_at == now + timedelta(hours=24)
+
+
+@pytest.mark.asyncio
 async def test_successful_retention_keeps_the_newest_five_snapshots(
     session: Session, tmp_path: Path, backup_workspace: tuple[User, GoogleDriveConnection, BackupSchedule]
 ) -> None:
@@ -369,7 +458,7 @@ async def test_successful_retention_keeps_the_newest_five_snapshots(
 
 
 @pytest.mark.asyncio
-async def test_revoked_connection_marks_connection_failed(
+async def test_revoked_connection_requires_reauthorization(
     session: Session, tmp_path: Path, backup_workspace: tuple[User, GoogleDriveConnection, BackupSchedule]
 ) -> None:
     user, connection, _ = backup_workspace
@@ -384,7 +473,57 @@ async def test_revoked_connection_marks_connection_failed(
 
     assert result.status == BackupStatus.failed
     session.refresh(connection)
-    assert connection.status == DriveConnectionStatus.failed
+    assert connection.status == DriveConnectionStatus.reauthorization_required
+
+
+@pytest.mark.asyncio
+async def test_manifest_owner_mismatch_fails_before_upload(
+    session: Session, tmp_path: Path, backup_workspace: tuple[User, GoogleDriveConnection, BackupSchedule]
+) -> None:
+    user, _, _ = backup_workspace
+    now = datetime(2026, 7, 24, 13, 0, tzinfo=UTC)
+    store = RecordingStore()
+    coordinator = _coordinator(
+        session,
+        tmp_path,
+        now,
+        store,
+        exporter=RecordingExporter(now, manifest_owner_id=uuid4()),
+    )
+
+    result = await coordinator.run_backup_for_user(user.id, BackupTrigger.manual)  # type: ignore[arg-type]
+
+    assert result.status == BackupStatus.failed
+    assert result.failure_message == "Backup verification failed"
+    assert store.backups == []
+
+
+@pytest.mark.asyncio
+async def test_cancellation_marks_backup_failed_then_reraises(
+    session: Session, tmp_path: Path, backup_workspace: tuple[User, GoogleDriveConnection, BackupSchedule]
+) -> None:
+    user, _, _ = backup_workspace
+    store = BlockingStore()
+    coordinator = _coordinator(
+        session,
+        tmp_path,
+        datetime(2026, 7, 24, 13, 0, tzinfo=UTC),
+        store,
+    )
+    backup = coordinator.start_backup(user.id, BackupTrigger.manual)  # type: ignore[arg-type]
+    task = asyncio.create_task(coordinator.run_backup(backup.backup_id))
+    await asyncio.wait_for(store.started.wait(), timeout=1)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    persisted = session.exec(
+        select(WorkspaceBackup).where(WorkspaceBackup.backup_id == backup.backup_id)
+    ).one()
+    assert persisted.status == BackupStatus.failed
+    assert persisted.failure_message == "Backup interrupted"
+    assert not any((tmp_path / "backup-temp").glob("**/*.zip"))
 
 
 @pytest.mark.asyncio

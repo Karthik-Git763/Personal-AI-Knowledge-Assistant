@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -19,7 +20,7 @@ class GoogleDriveAuthorizationUrlResponse(BaseModel):
 
 
 class WorkspaceBackupResponse(BaseModel):
-    id: int
+    backup_id: UUID
     status: BackupStatus
     trigger: BackupTrigger
     schema_version: int
@@ -31,17 +32,17 @@ class WorkspaceBackupResponse(BaseModel):
 
 
 class RestorePreviewResponse(BaseModel):
-    backup_id: int
+    backup_id: UUID
     schema_version: int
     item_counts: dict[str, int] = Field(default_factory=dict)
     archive_size_bytes: int | None = None
 
 
 class RestoreConfirmationRequest(BaseModel):
-    backup_id: int = Field(gt=0)
+    backup_id: UUID
     confirm: Literal[True]
 
 
 class BackupOperationStatusResponse(BaseModel):
     status: Literal["accepted", "completed", "failed"]
-    backup_id: int | None = None
+    backup_id: UUID | None = None

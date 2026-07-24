@@ -53,9 +53,20 @@ def test_all_backupable_models_generate_portable_ids() -> None:
 
 
 def test_backup_enums_use_persisted_values() -> None:
-    assert [status.value for status in BackupStatus] == ["pending", "running", "completed", "failed"]
+    assert [status.value for status in BackupStatus] == [
+        "pending",
+        "exporting",
+        "uploading",
+        "completed",
+        "failed",
+    ]
     assert [trigger.value for trigger in BackupTrigger] == ["manual", "scheduled"]
-    assert [status.value for status in DriveConnectionStatus] == ["connected", "disconnected", "failed"]
+    assert [status.value for status in DriveConnectionStatus] == [
+        "connected",
+        "disconnected",
+        "reauthorization_required",
+        "failed",
+    ]
 
 
 def test_backup_defaults_to_pending_manual_snapshot() -> None:
@@ -63,6 +74,7 @@ def test_backup_defaults_to_pending_manual_snapshot() -> None:
 
     assert backup.status is BackupStatus.pending
     assert backup.trigger is BackupTrigger.manual
+    assert isinstance(backup.backup_id, UUID)
     assert backup.schema_version == 1
     assert backup.item_counts == {}
 

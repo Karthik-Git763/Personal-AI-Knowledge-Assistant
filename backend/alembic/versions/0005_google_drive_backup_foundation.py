@@ -54,7 +54,7 @@ def upgrade() -> None:
         sa.Column("google_subject", sa.String(length=255), nullable=False),
         sa.Column("google_email", sa.String(length=255), nullable=False),
         sa.Column("granted_scopes", postgresql.JSONB(), nullable=False),
-        sa.Column("status", sa.String(length=20), nullable=False),
+        sa.Column("status", sa.String(length=32), nullable=False),
         sa.Column("connected_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("disconnected_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("created_at", sa.DateTime(), nullable=False),
@@ -88,6 +88,7 @@ def upgrade() -> None:
     op.create_table(
         "workspace_backups",
         sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("backup_id", postgresql.UUID(as_uuid=True), nullable=False),
         sa.Column("user_id", sa.Integer(), nullable=False),
         sa.Column("remote_file_id", sa.String(length=255), nullable=True),
         sa.Column("status", sa.String(length=20), nullable=False),
@@ -106,6 +107,7 @@ def upgrade() -> None:
     )
     op.create_index("ix_workspace_backups_user_created", "workspace_backups", ["user_id", "created_at"])
     op.create_index("ix_workspace_backups_user_status", "workspace_backups", ["user_id", "status"])
+    op.create_index("ix_workspace_backups_backup_id", "workspace_backups", ["backup_id"], unique=True)
 
     op.create_table(
         "backup_schedules",
@@ -127,6 +129,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_table("backup_schedules")
+    op.drop_index("ix_workspace_backups_backup_id", table_name="workspace_backups")
     op.drop_index("ix_workspace_backups_user_status", table_name="workspace_backups")
     op.drop_index("ix_workspace_backups_user_created", table_name="workspace_backups")
     op.drop_table("workspace_backups")

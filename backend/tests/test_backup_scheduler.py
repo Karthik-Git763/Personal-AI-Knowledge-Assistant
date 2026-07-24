@@ -4,8 +4,9 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlmodel import Session
+from sqlmodel import Session, select
 
+from app.core.database import engine
 from app.models.backup import BackupSchedule, BackupTrigger
 from app.models.user import User
 from app.services.backup_scheduler import BackupScheduler
@@ -67,6 +68,31 @@ async def test_scheduler_claim_prevents_duplicate_dispatch_across_workers(sessio
     assert first == 1
     assert second == 0
     assert len(coordinator.started_user_ids) == 1
+
+
+@pytest.mark.asyncio
+async def test_scheduler_skips_schedule_locked_by_another_session(session: Session) -> None:
+    due_at = datetime(2026, 7, 24, 12, 0, tzinfo=UTC)
+    locked_schedule = _due_schedule(session, "locked-schedule@example.com", due_at)
+    coordinator = SpyCoordinator()
+    locking_session = Session(engine)
+    try:
+        locking_session.exec(
+            select(BackupSchedule)
+            .where(BackupSchedule.id == locked_schedule.id)
+            .with_for_update()
+        ).one()
+        scheduler = BackupScheduler(
+            session_factory=lambda: Session(engine), coordinator=coordinator
+        )
+
+        count = await scheduler.run_due_once(now=due_at + timedelta(minutes=1))
+    finally:
+        locking_session.rollback()
+        locking_session.close()
+
+    assert count == 0
+    assert coordinator.started_user_ids == []
 
 
 @pytest.mark.asyncio

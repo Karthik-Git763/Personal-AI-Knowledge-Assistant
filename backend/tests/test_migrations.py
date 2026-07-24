@@ -1,7 +1,9 @@
+from typing import cast
+
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy import inspect, text
+from sqlalchemy import String, inspect, text
 from sqlalchemy.engine import Connection
 from sqlmodel import SQLModel
 
@@ -164,6 +166,17 @@ def test_google_drive_backup_upgrade_creates_schema() -> None:
     table_names = set(inspector.get_table_names())
 
     assert BACKUP_TABLES.issubset(table_names)
+
+    connection_columns = {
+        column["name"]: column for column in inspector.get_columns("google_drive_connections")
+    }
+    connection_status_type = cast(String, connection_columns["status"]["type"])
+    assert connection_status_type.length is not None
+    assert connection_status_type.length >= len("reauthorization_required")
+    backup_columns = {column["name"]: column for column in inspector.get_columns("workspace_backups")}
+    assert backup_columns["backup_id"]["nullable"] is False
+    backup_indexes = {index["name"]: index for index in inspector.get_indexes("workspace_backups")}
+    assert backup_indexes["ix_workspace_backups_backup_id"]["unique"] is True
 
     for table_name in PORTABLE_ID_TABLES:
         columns = {column["name"]: column for column in inspector.get_columns(table_name)}

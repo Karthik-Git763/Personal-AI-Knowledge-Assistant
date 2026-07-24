@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import tempfile
@@ -8,6 +9,7 @@ from contextlib import contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
+from uuid import UUID
 
 from sqlalchemy import text
 from sqlmodel import Session, col, select
@@ -25,7 +27,6 @@ from app.models.backup import (
 from app.models.user import User
 from app.services.backup_exporter import BackupExporter
 from app.services.backup_store import (
-    BackupCleanupError,
     BackupObjectMetadata,
     BackupStore,
     StoredBackup,
@@ -44,6 +45,10 @@ class BackupVerificationError(RuntimeError):
 
 class BackupPreconditionError(RuntimeError):
     """The workspace is not currently eligible for a backup."""
+
+
+class BackupInterruptedError(RuntimeError):
+    """A shutdown or caller cancellation interrupted the backup."""
 
 
 class BackupExporterProtocol(Protocol):
@@ -106,11 +111,13 @@ class BackupCoordinator:
             session.commit()
             return self._detach(session, backup)
 
-    async def run_backup(self, backup_id: int) -> WorkspaceBackup:
+    async def run_backup(self, backup_id: UUID) -> WorkspaceBackup:
         """Run an already-created backup operation identified by its durable ID."""
         with self._session(self.lock_session_factory) as lock_session:
             with self._session() as session:
-                backup = session.get(WorkspaceBackup, backup_id)
+                backup = session.exec(
+                    select(WorkspaceBackup).where(WorkspaceBackup.backup_id == backup_id)
+                ).one_or_none()
                 if backup is None:
                     raise BackupPreconditionError("Backup operation is unavailable")
                 if backup.status in {BackupStatus.completed, BackupStatus.failed}:
@@ -124,9 +131,9 @@ class BackupCoordinator:
 
     async def run_backup_for_user(self, user_id: int, trigger: BackupTrigger) -> WorkspaceBackup:
         backup = self.start_backup(user_id, trigger)
-        if backup.id is None:
+        if backup.backup_id is None:
             raise RuntimeError("Backup operation was not persisted")
-        return await self.run_backup(backup.id)
+        return await self.run_backup(backup.backup_id)
 
     async def _run_locked(self, session: Session, backup: WorkspaceBackup) -> WorkspaceBackup:
         temporary_path: Path | None = None
@@ -134,7 +141,7 @@ class BackupCoordinator:
         connection: GoogleDriveConnection | None = None
         now = self.clock()
         try:
-            backup.status = BackupStatus.running
+            backup.status = BackupStatus.exporting
             backup.started_at = now
             user, connection, schedule = self._requirements(session, backup.user_id)
             schedule.last_attempt_at = now
@@ -145,6 +152,8 @@ class BackupCoordinator:
             archive = temporary_path / "workspace-backup.zip"
             export = self.exporter_factory(session).export(user, archive)
             os.chmod(export.path, 0o600)
+            if export.manifest.owner_id != user.portable_id:
+                raise BackupVerificationError("Backup manifest owner does not match the workspace")
             metadata = BackupObjectMetadata(
                 owner_id=export.manifest.owner_id,
                 backup_id=export.manifest.backup_id,
@@ -152,6 +161,9 @@ class BackupCoordinator:
                 archive_checksum=export.archive_checksum,
                 created_at=export.manifest.created_at,
             )
+            backup.status = BackupStatus.uploading
+            session.add(backup)
+            session.commit()
             store = self.store_factory(session, user, connection)
             stored = await store.upload(export.path, metadata)
             self._verify_stored_backup(stored, metadata, export.archive_size)
@@ -171,13 +183,15 @@ class BackupCoordinator:
             session.add_all([backup, schedule])
             session.commit()
 
-            try:
-                await prune_successful_backups(store, owner_id=user.portable_id, keep=5)
-            except BackupCleanupError:
-                backup.failure_message = "Backup retention cleanup failed"
-                session.add(backup)
-                session.commit()
+            await self._run_retention_cleanup(session, backup, store, user.portable_id)
             return self._detach(session, backup)
+        except asyncio.CancelledError:
+            was_completed = backup.status == BackupStatus.completed
+            session.rollback()
+            if was_completed:
+                raise
+            self._mark_failed(session, backup.id, BackupInterruptedError(), connection)
+            raise
         except Exception as error:
             session.rollback()
             return self._mark_failed(session, backup.id, error, connection)
@@ -188,6 +202,26 @@ class BackupCoordinator:
             if closer is not None:
                 with suppress(Exception):
                     await closer()
+
+    async def _run_retention_cleanup(
+        self, session: Session, backup: WorkspaceBackup, store: BackupStore, owner_id: UUID
+    ) -> None:
+        try:
+            await prune_successful_backups(store, owner_id=owner_id, keep=5)
+        except asyncio.CancelledError:
+            self._record_cleanup_warning(session, backup)
+            raise
+        except Exception:
+            self._record_cleanup_warning(session, backup)
+
+    @staticmethod
+    def _record_cleanup_warning(session: Session, backup: WorkspaceBackup) -> None:
+        try:
+            backup.failure_message = "Backup retention cleanup failed"
+            session.add(backup)
+            session.commit()
+        except Exception:
+            session.rollback()
 
     def _requirements(
         self, session: Session, user_id: int
@@ -235,7 +269,7 @@ class BackupCoordinator:
                 select(GoogleDriveConnection).where(GoogleDriveConnection.user_id == backup.user_id)
             ).one_or_none()
             if current_connection is not None:
-                current_connection.status = DriveConnectionStatus.failed
+                current_connection.status = DriveConnectionStatus.reauthorization_required
                 session.add(current_connection)
         session.add(backup)
         session.commit()
@@ -268,6 +302,8 @@ class BackupCoordinator:
             return "Google Drive reauthorization required"
         if isinstance(error, BackupPreconditionError):
             return "Backup prerequisites are unavailable"
+        if isinstance(error, BackupInterruptedError):
+            return "Backup interrupted"
         return "Backup failed"
 
     @staticmethod
@@ -276,7 +312,9 @@ class BackupCoordinator:
             select(WorkspaceBackup)
             .where(
                 WorkspaceBackup.user_id == user_id,
-                col(WorkspaceBackup.status).in_([BackupStatus.pending, BackupStatus.running]),
+                col(WorkspaceBackup.status).in_(
+                    [BackupStatus.pending, BackupStatus.exporting, BackupStatus.uploading]
+                ),
             )
             .order_by(col(WorkspaceBackup.created_at).desc())
         ).first()
