@@ -8,6 +8,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Query, status
 from fastapi.responses import RedirectResponse
+from sqlalchemy.dialects.postgresql import insert
 from sqlmodel import col, select
 
 from app.api.deps import CurrentUser, SessionDep
@@ -185,6 +186,7 @@ def _matching_local_backup(
     return session.exec(
         select(WorkspaceBackup).where(
             WorkspaceBackup.user_id == user_id,
+            WorkspaceBackup.backup_id == remote.metadata.backup_id,
             WorkspaceBackup.remote_file_id == remote.remote_id,
             WorkspaceBackup.status == BackupStatus.completed,
             WorkspaceBackup.operation_kind == BackupOperationKind.snapshot,
@@ -192,10 +194,67 @@ def _matching_local_backup(
     ).one_or_none()
 
 
+def _adopt_remote_backups(
+    session: SessionDep,
+    user_id: int,
+    drive_owner_id: UUID,
+    remote_backups: list[StoredBackup],
+) -> dict[str, WorkspaceBackup]:
+    trusted = [
+        remote
+        for remote in remote_backups
+        if is_valid_stored_backup(remote, drive_owner_id)
+    ]
+    if not trusted:
+        return {}
+
+    for remote in trusted:
+        timestamp = remote.metadata.created_at
+        statement = (
+            insert(WorkspaceBackup)
+            .values(
+                backup_id=remote.metadata.backup_id,
+                user_id=user_id,
+                operation_kind=BackupOperationKind.snapshot,
+                remote_file_id=remote.remote_id,
+                status=BackupStatus.completed,
+                trigger=BackupTrigger.scheduled,
+                schema_version=remote.metadata.schema_version,
+                archive_size_bytes=remote.size,
+                checksum=remote.metadata.archive_checksum,
+                item_counts={},
+                started_at=timestamp,
+                completed_at=timestamp,
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+            .on_conflict_do_nothing(index_elements=["backup_id"])
+        )
+        session.exec(statement)
+    session.commit()
+
+    backup_ids = [remote.metadata.backup_id for remote in trusted]
+    local_backups = session.exec(
+        select(WorkspaceBackup).where(
+            WorkspaceBackup.user_id == user_id,
+            col(WorkspaceBackup.backup_id).in_(backup_ids),
+            WorkspaceBackup.status == BackupStatus.completed,
+            WorkspaceBackup.operation_kind == BackupOperationKind.snapshot,
+        )
+    ).all()
+    return {
+        backup.remote_file_id: backup
+        for backup in local_backups
+        if backup.remote_file_id is not None
+    }
+
+
 def _restore_eligible(backup: WorkspaceBackup, remote: StoredBackup) -> bool:
     return (
         backup.operation_kind == BackupOperationKind.snapshot
         and backup.status == BackupStatus.completed
+        and backup.backup_id == remote.metadata.backup_id
+        and backup.remote_file_id == remote.remote_id
         and backup.schema_version in _SUPPORTED_RESTORE_SCHEMA_VERSIONS
         and remote.completed
         and remote.metadata.schema_version == backup.schema_version
@@ -233,7 +292,7 @@ def connect_google_drive(session: SessionDep, current_user: CurrentUser) -> Goog
 async def google_drive_callback(
     session: SessionDep, state: str | None = Query(default=None), code: str | None = Query(default=None)
 ) -> RedirectResponse:
-    frontend_settings = f"{settings.FRONTEND_HOST.rstrip('/')}/settings"
+    frontend_settings = f"{settings.FRONTEND_HOST.rstrip('/')}/dashboard/settings"
     if not settings.google_drive_backup_enabled:
         return RedirectResponse(f"{frontend_settings}?drive=not_configured", status_code=303)
     if not state or not code:
@@ -306,8 +365,12 @@ async def google_drive_status(
     restore_points: list[RestorePointSummary] = []
     if connection is not None and connection.status == DriveConnectionStatus.connected:
         remote_backups = await _trusted_remote_backups(session, current_user, connection)
+        owner_id = derive_drive_owner_id(connection.google_subject)
+        local_by_remote = _adopt_remote_backups(
+            session, user_id, owner_id, remote_backups
+        )
         for remote in sorted(remote_backups, key=lambda backup: backup.created_at, reverse=True)[:5]:
-            local = _matching_local_backup(session, user_id, remote)
+            local = local_by_remote.get(remote.remote_id)
             if local is not None:
                 restore_points.append(
                     RestorePointSummary(
@@ -390,17 +453,10 @@ async def list_backups(session: SessionDep, current_user: CurrentUser) -> list[W
     user_id = _current_user_id(current_user)
     connection = _connection(session, user_id)
     remote_backups = await _trusted_remote_backups(session, current_user, connection)
-    local_by_remote = {
-        backup.remote_file_id: backup
-        for backup in session.exec(
-            select(WorkspaceBackup).where(
-                WorkspaceBackup.user_id == user_id,
-                WorkspaceBackup.status == BackupStatus.completed,
-                WorkspaceBackup.operation_kind == BackupOperationKind.snapshot,
-            )
-        ).all()
-        if backup.remote_file_id is not None
-    }
+    owner_id = derive_drive_owner_id(connection.google_subject)
+    local_by_remote = _adopt_remote_backups(
+        session, user_id, owner_id, remote_backups
+    )
     return [
         _operation_response(
             local_by_remote[remote.remote_id],

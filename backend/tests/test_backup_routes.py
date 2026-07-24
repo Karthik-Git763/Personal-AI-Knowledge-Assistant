@@ -1,12 +1,15 @@
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
-from sqlmodel import select
+from sqlmodel import Session, select
 
 from app.api.deps import get_current_user
+from app.api.routes.backups import _adopt_remote_backups
 from app.core.config import settings
+from app.core.database import engine
 from app.main import app
 from app.models.backup import (
     BackupSchedule,
@@ -19,7 +22,11 @@ from app.models.backup import (
 from app.models.user import User
 from app.services.backup_coordinator import BackupCoordinator
 from app.services.backup_store import BackupObjectMetadata, StoredBackup
-from app.services.google_drive_oauth import GoogleDriveOAuthService, derive_drive_owner_id
+from app.services.google_drive_oauth import (
+    GoogleDriveOAuthError,
+    GoogleDriveOAuthService,
+    derive_drive_owner_id,
+)
 from app.services.google_drive_store import GoogleDriveRetryableError
 
 
@@ -71,6 +78,7 @@ def _remote_backup(
     completed: bool = True,
     schema_version: int = 1,
     created_at: datetime | None = None,
+    backup_id: UUID | None = None,
 ) -> StoredBackup:
     timestamp = created_at or datetime(2026, 7, 24, 12, 0, tzinfo=UTC)
     return StoredBackup(
@@ -81,7 +89,7 @@ def _remote_backup(
         metadata=BackupObjectMetadata(
             drive_owner_id=owner_id,
             workspace_owner_id=uuid4(),
-            backup_id=uuid4(),
+            backup_id=backup_id or uuid4(),
             schema_version=schema_version,
             archive_checksum="a" * 64,
             created_at=timestamp,
@@ -318,8 +326,8 @@ def test_callback_uses_state_binding_and_rejects_replay(session, monkeypatch) ->
     finally:
         app.dependency_overrides.clear()
 
-    assert first.headers["location"].endswith("/settings?drive=connected")
-    assert replay.headers["location"].endswith("/settings?drive=invalid_state")
+    assert first.headers["location"].endswith("/dashboard/settings?drive=connected")
+    assert replay.headers["location"].endswith("/dashboard/settings?drive=invalid_state")
 
 
 def test_callback_never_redirects_to_provider_query_value(session, monkeypatch) -> None:
@@ -334,8 +342,43 @@ def test_callback_never_redirects_to_provider_query_value(session, monkeypatch) 
     finally:
         app.dependency_overrides.clear()
 
-    assert response.headers["location"].endswith("/settings?drive=invalid_state")
+    assert response.headers["location"].endswith("/dashboard/settings?drive=invalid_state")
     assert "evil.example" not in response.headers["location"]
+
+
+def test_callback_failure_redirects_to_dashboard_settings(session, monkeypatch) -> None:
+    client, user = _authenticated_client(session)
+    assert user.id is not None
+    _configure_drive(monkeypatch)
+    raw_state = "failed-state-value"
+    session.add(
+        OAuthState(
+            user_id=user.id,
+            state_hash=hashlib.sha256(raw_state.encode()).hexdigest(),
+            expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
+    )
+    session.commit()
+
+    async def fail_authorization(*_: object, **__: object) -> None:
+        raise GoogleDriveOAuthError("provider details")
+
+    monkeypatch.setattr(
+        GoogleDriveOAuthService, "complete_authorization", fail_authorization
+    )
+    try:
+        response = client.get(
+            "/api/v1/users/me/google-drive/callback",
+            params={"state": raw_state, "code": "authorization-code"},
+            follow_redirects=False,
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.headers["location"].endswith(
+        "/dashboard/settings?drive=authorization_failed"
+    )
+    assert "provider details" not in response.headers["location"]
 
 
 def test_disconnect_clears_local_connection_without_deleting_backup_records(session, monkeypatch) -> None:
@@ -499,12 +542,14 @@ def test_backup_list_orders_restore_points_and_marks_unsupported_schema_ineligib
     newer = _remote_backup(
         "unsupported-id",
         owner_id=derive_drive_owner_id(connection.google_subject),
+        backup_id=unsupported.backup_id,
         schema_version=99,
         created_at=datetime(2026, 7, 25, 12, 0, tzinfo=UTC),
     )
     older = _remote_backup(
         "supported-id",
         owner_id=newer.metadata.drive_owner_id,
+        backup_id=supported.backup_id,
         created_at=datetime(2026, 7, 24, 12, 0, tzinfo=UTC),
     )
 
@@ -525,6 +570,161 @@ def test_backup_list_orders_restore_points_and_marks_unsupported_schema_ineligib
     assert [item["restore_eligible"] for item in response.json()] == [False, True]
     assert "checksum" not in response.text
     assert "remote_file_id" not in response.text
+
+
+def test_backup_list_adopts_trusted_remote_snapshot_for_current_user(
+    session, monkeypatch
+) -> None:
+    client, user = _authenticated_client(session)
+    assert user.id is not None
+    connection = _connection(session, user)
+    _configure_drive(monkeypatch)
+    owner_id = derive_drive_owner_id(connection.google_subject)
+    backup_id = uuid4()
+    created_at = datetime(2026, 7, 23, 8, 30, tzinfo=UTC)
+    remote = _remote_backup(
+        "fresh-install-remote-id",
+        owner_id=owner_id,
+        backup_id=backup_id,
+        created_at=created_at,
+    )
+
+    async def remote_backups(*_: object) -> list[StoredBackup]:
+        return [remote]
+
+    monkeypatch.setattr("app.api.routes.backups._trusted_remote_backups", remote_backups)
+    try:
+        response = client.get("/api/v1/users/me/backups")
+    finally:
+        app.dependency_overrides.clear()
+
+    adopted = session.exec(
+        select(WorkspaceBackup).where(
+            WorkspaceBackup.user_id == user.id,
+            WorkspaceBackup.backup_id == backup_id,
+        )
+    ).one()
+    assert response.status_code == 200
+    assert response.json()[0]["backup_id"] == str(backup_id)
+    assert response.json()[0]["restore_eligible"] is True
+    assert adopted.remote_file_id == remote.remote_id
+    assert adopted.schema_version == remote.metadata.schema_version
+    assert adopted.checksum == remote.metadata.archive_checksum
+    assert adopted.archive_size_bytes == remote.size
+    assert adopted.created_at == created_at.replace(tzinfo=None)
+    assert adopted.completed_at == created_at
+
+
+def test_status_adopts_remote_snapshot_once_across_repeated_requests(
+    session, monkeypatch
+) -> None:
+    client, user = _authenticated_client(session)
+    assert user.id is not None
+    connection = _connection(session, user)
+    _configure_drive(monkeypatch)
+    remote = _remote_backup(
+        "idempotent-remote-id",
+        owner_id=derive_drive_owner_id(connection.google_subject),
+        backup_id=uuid4(),
+    )
+
+    async def remote_backups(*_: object) -> list[StoredBackup]:
+        return [remote]
+
+    monkeypatch.setattr("app.api.routes.backups._trusted_remote_backups", remote_backups)
+    try:
+        first = client.get("/api/v1/users/me/google-drive/status")
+        second = client.get("/api/v1/users/me/google-drive/status")
+    finally:
+        app.dependency_overrides.clear()
+
+    adopted = session.exec(
+        select(WorkspaceBackup).where(
+            WorkspaceBackup.user_id == user.id,
+            WorkspaceBackup.backup_id == remote.metadata.backup_id,
+        )
+    ).all()
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["restore_points"][0]["restore_eligible"] is True
+    assert second.json()["restore_points"][0]["restore_eligible"] is True
+    assert len(adopted) == 1
+
+
+def test_remote_adoption_is_race_safe_across_database_sessions(
+    session, monkeypatch
+) -> None:
+    _, user = _authenticated_client(session)
+    assert user.id is not None
+    user_id = user.id
+    owner_id = uuid4()
+    remote = _remote_backup(
+        "concurrent-remote-id",
+        owner_id=owner_id,
+        backup_id=uuid4(),
+    )
+
+    def adopt() -> None:
+        with Session(engine) as concurrent_session:
+            _adopt_remote_backups(
+                concurrent_session, user_id, owner_id, [remote]
+            )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            list(executor.map(lambda _: adopt(), range(2)))
+    finally:
+        app.dependency_overrides.clear()
+
+    session.expire_all()
+    adopted = session.exec(
+        select(WorkspaceBackup).where(
+            WorkspaceBackup.user_id == user_id,
+            WorkspaceBackup.backup_id == remote.metadata.backup_id,
+        )
+    ).all()
+    assert len(adopted) == 1
+
+
+def test_backup_list_never_adopts_untrusted_remote_objects(session, monkeypatch) -> None:
+    client, user = _authenticated_client(session)
+    assert user.id is not None
+    connection = _connection(session, user)
+    _configure_drive(monkeypatch)
+    owner_id = derive_drive_owner_id(connection.google_subject)
+    incomplete = _remote_backup("incomplete-remote-id", owner_id=owner_id, completed=False)
+    foreign = _remote_backup("foreign-remote-id", owner_id=uuid4())
+    malformed = StoredBackup(
+        remote_id="malformed-remote-id",
+        name="cognolith-malformed.zip",
+        size=100,
+        created_at=datetime(2026, 7, 24, 12, 0, tzinfo=UTC),
+        metadata=BackupObjectMetadata(
+            drive_owner_id=owner_id,
+            workspace_owner_id=uuid4(),
+            backup_id=uuid4(),
+            schema_version=1,
+            archive_checksum="not-a-checksum",
+            created_at=datetime(2026, 7, 24, 12, 0, tzinfo=UTC),
+        ),
+        completed=True,
+    )
+
+    async def remote_backups(*_: object) -> list[StoredBackup]:
+        return [incomplete, foreign, malformed]
+
+    monkeypatch.setattr("app.api.routes.backups._trusted_remote_backups", remote_backups)
+    try:
+        response = client.get("/api/v1/users/me/backups")
+    finally:
+        app.dependency_overrides.clear()
+
+    adopted = session.exec(
+        select(WorkspaceBackup).where(WorkspaceBackup.user_id == user.id)
+    ).all()
+    assert response.status_code == 200
+    assert response.json() == []
+    assert adopted == []
 
 
 def test_operation_status_exposes_each_durable_phase(session) -> None:
