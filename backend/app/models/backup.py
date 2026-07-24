@@ -33,6 +33,11 @@ class BackupTrigger(StrEnum):
     scheduled = "scheduled"
 
 
+class BackupOperationKind(StrEnum):
+    snapshot = "snapshot"
+    restore = "restore"
+
+
 class DriveConnectionStatus(StrEnum):
     connected = "connected"
     disconnected = "disconnected"
@@ -102,6 +107,14 @@ class WorkspaceBackup(TimestampMixin, SQLModel, table=True):
         sa_column=Column(PGUUID(as_uuid=True), nullable=False, unique=True, index=True),
     )
     user_id: int = Field(foreign_key="users.id", nullable=False, index=True)
+    operation_kind: BackupOperationKind = Field(
+        default=BackupOperationKind.snapshot,
+        sa_column=Column(String(20), nullable=False),
+    )
+    source_backup_id: UUID | None = Field(
+        default=None,
+        sa_column=Column(PGUUID(as_uuid=True), nullable=True, index=True),
+    )
     remote_file_id: str | None = Field(default=None, max_length=255, index=True)
     status: BackupStatus = Field(default=BackupStatus.pending, sa_column=Column(String(20), nullable=False))
     trigger: BackupTrigger = Field(default=BackupTrigger.manual, sa_column=Column(String(20), nullable=False))

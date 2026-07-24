@@ -4,6 +4,7 @@ import pytest
 from sqlmodel import SQLModel
 
 from app.models.backup import (
+    BackupOperationKind,
     BackupSchedule,
     BackupStatus,
     BackupTrigger,
@@ -16,7 +17,7 @@ from app.models.chat import ChatMessages, ChatRole, ChatSession
 from app.models.document import Document
 from app.models.note import NoteCategory, NoteFolders, NoteLinks, Notes, NoteTags, NoteTemplates
 from app.models.user import User
-from app.schemas.backup import BackupOperationStatusResponse
+from app.schemas.backup import BackupOperationStatusResponse, RestoreConfirmationRequest
 
 
 def test_portable_ids_are_generated_and_distinct() -> None:
@@ -77,11 +78,29 @@ def test_backup_operation_status_schema_uses_all_persisted_statuses() -> None:
     } == set(BackupStatus)
 
 
+def test_restore_confirmation_schema_requires_exact_restore_literal() -> None:
+    backup_id = uuid4()
+
+    request = RestoreConfirmationRequest(
+        backup_id=backup_id,
+        confirmation="RESTORE",
+    )
+
+    assert request.confirmation == "RESTORE"
+    with pytest.raises(ValueError):
+        RestoreConfirmationRequest(
+            backup_id=backup_id,
+            confirmation="restore",
+        )
+
+
 def test_backup_defaults_to_pending_manual_snapshot() -> None:
     backup = WorkspaceBackup(user_id=1)
 
     assert backup.status is BackupStatus.pending
     assert backup.trigger is BackupTrigger.manual
+    assert backup.operation_kind is BackupOperationKind.snapshot
+    assert backup.source_backup_id is None
     assert isinstance(backup.backup_id, UUID)
     assert backup.schema_version == 1
     assert backup.item_counts == {}

@@ -4,7 +4,12 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from app.models.backup import BackupStatus, BackupTrigger, DriveConnectionStatus
+from app.models.backup import (
+    BackupOperationKind,
+    BackupStatus,
+    BackupTrigger,
+    DriveConnectionStatus,
+)
 
 
 class GoogleDriveConnectionStatusResponse(BaseModel):
@@ -21,6 +26,8 @@ class GoogleDriveAuthorizationUrlResponse(BaseModel):
 
 class WorkspaceBackupResponse(BaseModel):
     backup_id: UUID
+    operation_kind: BackupOperationKind
+    source_backup_id: UUID | None = None
     status: BackupStatus
     trigger: BackupTrigger
     schema_version: int
@@ -38,9 +45,22 @@ class RestorePreviewResponse(BaseModel):
     archive_size_bytes: int | None = None
 
 
+class BackupPreview(BaseModel):
+    created_at: datetime
+    schema_version: int
+    app_version: str
+    archive_size_bytes: int
+    item_counts: dict[str, int] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class RestoreResult(BaseModel):
+    reprocessing_document_ids: list[int] = Field(default_factory=list)
+
+
 class RestoreConfirmationRequest(BaseModel):
     backup_id: UUID
-    confirm: Literal[True]
+    confirmation: Literal["RESTORE"]
 
 
 class BackupOperationStatusResponse(BaseModel):

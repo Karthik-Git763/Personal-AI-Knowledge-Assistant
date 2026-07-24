@@ -175,6 +175,8 @@ def test_google_drive_backup_upgrade_creates_schema() -> None:
     assert connection_status_type.length >= len("reauthorization_required")
     backup_columns = {column["name"]: column for column in inspector.get_columns("workspace_backups")}
     assert backup_columns["backup_id"]["nullable"] is False
+    assert backup_columns["operation_kind"]["nullable"] is False
+    assert backup_columns["source_backup_id"]["nullable"] is True
     backup_indexes = {index["name"]: index for index in inspector.get_indexes("workspace_backups")}
     assert backup_indexes["ix_workspace_backups_backup_id"]["unique"] is True
 
