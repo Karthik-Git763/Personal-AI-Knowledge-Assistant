@@ -230,6 +230,37 @@ async def test_complete_authorization_exchanges_code_and_upserts_connection(sess
 
 
 @pytest.mark.asyncio
+async def test_google_subject_cannot_be_connected_to_two_local_users(
+    session: Session,
+) -> None:
+    first_user = _create_user(session, email="first-drive-owner@example.com")
+    second_user = _create_user(session, email="second-drive-owner@example.com")
+    settings = _settings()
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_google_response)
+    ) as client:
+        service = _oauth_service(session, client, settings)
+        first_state = service.create_state(user_id=first_user.id)
+        await service.complete_authorization(
+            user_id=first_user.id,
+            state=first_state,
+            code="first-code",
+        )
+        second_state = service.create_state(user_id=second_user.id)
+        with pytest.raises(GoogleDriveOAuthError, match="already connected"):
+            await service.complete_authorization(
+                user_id=second_user.id,
+                state=second_state,
+                code="second-code",
+            )
+
+    connections = session.exec(select(GoogleDriveConnection)).all()
+    assert len(connections) == 1
+    assert connections[0].user_id == first_user.id
+
+
+@pytest.mark.asyncio
 async def test_complete_authorization_preserves_existing_refresh_token(session: Session) -> None:
     user = _create_user(session)
     settings = _settings()

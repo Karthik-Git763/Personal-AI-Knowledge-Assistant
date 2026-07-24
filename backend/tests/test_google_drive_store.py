@@ -78,7 +78,10 @@ def _connection(
 
 
 def _metadata(
-    drive_owner_id: UUID, workspace_owner_id: UUID | None = None
+    drive_owner_id: UUID,
+    workspace_owner_id: UUID | None = None,
+    *,
+    include_optional: bool = True,
 ) -> BackupObjectMetadata:
     return BackupObjectMetadata(
         drive_owner_id=drive_owner_id,
@@ -87,6 +90,8 @@ def _metadata(
         schema_version=1,
         archive_checksum=CHECKSUM,
         created_at=datetime(2026, 7, 24, 12, 0, tzinfo=UTC),
+        app_version="0.1.0" if include_optional else None,
+        item_counts={"notes": 4, "documents": 2} if include_optional else {},
     )
 
 
@@ -98,22 +103,27 @@ def _drive_file(
     parents: list[str] | None = None,
     server_created_at: datetime = SERVER_CREATED_AT,
 ) -> dict[str, Any]:
+    app_properties = {
+        "cognolith": "backup",
+        "drive_owner_id": str(metadata.drive_owner_id),
+        "workspace_owner_id": str(metadata.workspace_owner_id),
+        "backup_id": str(metadata.backup_id),
+        "schema_version": str(metadata.schema_version),
+        "archive_checksum": metadata.archive_checksum,
+        "created_at": metadata.created_at.isoformat().replace("+00:00", "Z"),
+        "completed": str(completed).lower(),
+    }
+    if metadata.app_version is not None:
+        app_properties["app_version"] = metadata.app_version
+    if metadata.item_counts:
+        app_properties["item_counts"] = '{"d":2,"n":4}'
     return {
         "id": remote_id,
         "name": f"cognolith-{metadata.backup_id}.zip",
         "size": str(len(ARCHIVE_BYTES)),
         "createdTime": server_created_at.isoformat().replace("+00:00", "Z"),
         "parents": parents if parents is not None else ["appDataFolder"],
-        "appProperties": {
-            "cognolith": "backup",
-            "drive_owner_id": str(metadata.drive_owner_id),
-            "workspace_owner_id": str(metadata.workspace_owner_id),
-            "backup_id": str(metadata.backup_id),
-            "schema_version": str(metadata.schema_version),
-            "archive_checksum": metadata.archive_checksum,
-            "created_at": metadata.created_at.isoformat().replace("+00:00", "Z"),
-            "completed": str(completed).lower(),
-        },
+        "appProperties": app_properties,
     }
 
 
@@ -256,15 +266,58 @@ async def test_list_returns_only_valid_owner_backups_and_authorizes_remote_id_fo
 
 
 @pytest.mark.asyncio
+async def test_list_parses_legacy_metadata_without_optional_properties(
+    session: Session, configured_token_encryption: Settings
+) -> None:
+    metadata: BackupObjectMetadata | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url == GoogleDriveOAuthService.TOKEN_URL:
+            return _token_response(request)
+        assert metadata is not None
+        return httpx.Response(200, json={"files": [_drive_file(metadata)]})
+
+    store, owner_id = await _store(session, configured_token_encryption, handler)
+    metadata = _metadata(owner_id, include_optional=False)
+    try:
+        listed = await store.list(owner_id)
+    finally:
+        await store.aclose()
+
+    assert listed[0].metadata.app_version is None
+    assert listed[0].metadata.item_counts == {}
+
+
+@pytest.mark.asyncio
+async def test_list_rejects_unbounded_or_invalid_optional_metadata(
+    session: Session, configured_token_encryption: Settings
+) -> None:
+    metadata: BackupObjectMetadata | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url == GoogleDriveOAuthService.TOKEN_URL:
+            return _token_response(request)
+        assert metadata is not None
+        payload = _drive_file(metadata)
+        payload["appProperties"]["item_counts"] = '{"unknown":1}'
+        return httpx.Response(200, json={"files": [payload]})
+
+    store, owner_id = await _store(session, configured_token_encryption, handler)
+    metadata = _metadata(owner_id)
+    try:
+        with pytest.raises(GoogleDriveMalformedPayloadError, match="item counts"):
+            await store.list(owner_id)
+    finally:
+        await store.aclose()
+
+
+@pytest.mark.asyncio
 async def test_same_google_subject_on_second_installation_lists_and_authorizes_prior_snapshot(
     session: Session, configured_token_encryption: Settings
 ) -> None:
-    first_workspace_owner_id, _ = _connection(
-        session,
-        configured_token_encryption,
-        email="first-install@example.com",
-        google_subject="shared-google-subject",
-    )
+    # The first installation has a separate database; only its portable owner
+    # identity remains in the remote snapshot metadata.
+    first_workspace_owner_id = uuid4()
     second_workspace_owner_id, second_connection = _connection(
         session,
         configured_token_encryption,

@@ -31,6 +31,7 @@ class WorkspaceBackupResponse(BaseModel):
     status: BackupStatus
     trigger: BackupTrigger
     schema_version: int
+    app_version: str | None = None
     archive_size_bytes: int | None = None
     item_counts: dict[str, int] = Field(default_factory=dict)
     started_at: datetime | None = None
@@ -75,9 +76,11 @@ class DeleteBackupsConfirmationRequest(BaseModel):
 class RestorePointSummary(BaseModel):
     backup_id: UUID
     schema_version: int
+    app_version: str | None = None
     archive_size_bytes: int
     created_at: datetime
     restore_eligible: bool
+    item_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class GoogleDriveBackupStatusResponse(BaseModel):

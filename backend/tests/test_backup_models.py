@@ -79,19 +79,13 @@ def test_backup_operation_status_schema_uses_all_persisted_statuses() -> None:
 
 
 def test_restore_confirmation_schema_requires_exact_restore_literal() -> None:
-    backup_id = uuid4()
-
     request = RestoreConfirmationRequest(
-        backup_id=backup_id,
         confirmation="RESTORE",
     )
 
     assert request.confirmation == "RESTORE"
     with pytest.raises(ValueError):
-        RestoreConfirmationRequest(
-            backup_id=backup_id,
-            confirmation="restore",
-        )
+        RestoreConfirmationRequest.model_validate({"confirmation": "restore"})
 
 
 def test_backup_defaults_to_pending_manual_snapshot() -> None:

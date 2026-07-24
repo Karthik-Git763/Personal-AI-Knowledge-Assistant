@@ -35,6 +35,7 @@ from app.services.backup_importer import (
     RestoreResult,
 )
 from app.services.backup_store import (
+    MINIMUM_BACKUP_ARCHIVE_SIZE,
     BackupObjectMetadata,
     BackupStore,
     StoredBackup,
@@ -61,7 +62,9 @@ class BackupInterruptedError(RuntimeError):
 
 
 class BackupExporterProtocol(Protocol):
-    def export(self, user: User, destination: Path) -> Any: ...
+    def export(
+        self, user: User, destination: Path, *, backup_id: UUID | None = None
+    ) -> Any: ...
 
 
 class BackupStoreFactory(Protocol):
@@ -76,7 +79,10 @@ class BackupExporterFactory(Protocol):
 
 class BackupImporterProtocol(Protocol):
     def preview(
-        self, path: Path, expected_workspace_owner_id: UUID
+        self,
+        path: Path,
+        expected_workspace_owner_id: UUID,
+        expected_archive_backup_id: UUID | None = None,
     ) -> BackupPreview: ...
 
     def restore(
@@ -85,6 +91,7 @@ class BackupImporterProtocol(Protocol):
         user: User,
         expected_workspace_owner_id: UUID,
         *,
+        expected_archive_backup_id: UUID | None = None,
         operation: WorkspaceBackup,
         completed_at: datetime,
     ) -> RestoreResult: ...
@@ -209,6 +216,7 @@ class BackupCoordinator:
                 return self.importer_factory(session).preview(
                     archive,
                     expected_workspace_owner_id=stored.metadata.workspace_owner_id,
+                    expected_archive_backup_id=stored.metadata.backup_id,
                 )
         finally:
             if temporary_path is not None:
@@ -309,6 +317,9 @@ class BackupCoordinator:
                             expected_workspace_owner_id=(
                                 stored.metadata.workspace_owner_id
                             ),
+                            expected_archive_backup_id=(
+                                stored.metadata.backup_id
+                            ),
                         )
 
                         safety_backup = WorkspaceBackup(
@@ -334,6 +345,9 @@ class BackupCoordinator:
                             user,
                             expected_workspace_owner_id=(
                                 stored.metadata.workspace_owner_id
+                            ),
+                            expected_archive_backup_id=(
+                                stored.metadata.backup_id
                             ),
                             operation=operation,
                             completed_at=self.clock(),
@@ -391,7 +405,11 @@ class BackupCoordinator:
 
             temporary_path = self._create_temporary_directory()
             archive = temporary_path / "workspace-backup.zip"
-            export = self.exporter_factory(session).export(user, archive)
+            export = self.exporter_factory(session).export(
+                user,
+                archive,
+                backup_id=backup.backup_id,
+            )
             os.chmod(export.path, 0o600)
             if export.manifest.owner_id != user.portable_id:
                 raise BackupVerificationError("Backup manifest owner does not match the workspace")
@@ -403,6 +421,8 @@ class BackupCoordinator:
                 schema_version=export.manifest.schema_version,
                 archive_checksum=export.archive_checksum,
                 created_at=export.manifest.created_at,
+                app_version=export.manifest.app_version,
+                item_counts=dict(export.manifest.counts),
             )
             backup.status = BackupStatus.uploading
             session.add(backup)
@@ -421,7 +441,10 @@ class BackupCoordinator:
             backup.completed_at = completed_at
             backup.failure_message = None
             schedule.last_success_at = completed_at
-            schedule.next_due_at = completed_at + timedelta(hours=24)
+            schedule.interval_hours = settings.BACKUP_INTERVAL_HOURS
+            schedule.next_due_at = completed_at + timedelta(
+                hours=settings.BACKUP_INTERVAL_HOURS
+            )
             schedule.consecutive_failures = 0
             session.add_all([backup, schedule])
             session.commit()
@@ -453,7 +476,11 @@ class BackupCoordinator:
         self, session: Session, backup: WorkspaceBackup, store: BackupStore, drive_owner_id: UUID
     ) -> None:
         try:
-            await prune_successful_backups(store, drive_owner_id=drive_owner_id, keep=5)
+            await prune_successful_backups(
+                store,
+                drive_owner_id=drive_owner_id,
+                keep=settings.BACKUP_RETENTION_COUNT,
+            )
         except asyncio.CancelledError:
             self._record_cleanup_warning(session, backup)
             raise
@@ -571,7 +598,8 @@ class BackupCoordinator:
                 "Backup download is unavailable"
             ) from error
         if (
-            size > settings.BACKUP_MAX_ARCHIVE_SIZE
+            size < MINIMUM_BACKUP_ARCHIVE_SIZE
+            or size > settings.BACKUP_MAX_ARCHIVE_SIZE
             or size != stored.size
             or (
                 source.archive_size_bytes is not None

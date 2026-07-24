@@ -67,6 +67,7 @@ BackupRestoreFailed = BackupRestoreFailedError
 
 @dataclass(frozen=True)
 class _ValidatedArchive:
+    backup_id: UUID
     created_at: datetime
     schema_version: int
     app_version: str
@@ -362,9 +363,18 @@ class BackupImporter:
         self.session = session
         self.move_file = move_file
 
-    def preview(self, path: Path, expected_workspace_owner_id: UUID) -> BackupPreview:
+    def preview(
+        self,
+        path: Path,
+        expected_workspace_owner_id: UUID,
+        expected_archive_backup_id: UUID | None = None,
+    ) -> BackupPreview:
         archive_path = Path(path)
-        validated = self._validate(archive_path, expected_workspace_owner_id)
+        validated = self._validate(
+            archive_path,
+            expected_workspace_owner_id,
+            expected_archive_backup_id,
+        )
         return BackupPreview(
             created_at=validated.created_at,
             schema_version=validated.schema_version,
@@ -380,6 +390,7 @@ class BackupImporter:
         user: User,
         expected_workspace_owner_id: UUID,
         *,
+        expected_archive_backup_id: UUID | None = None,
         operation: WorkspaceBackup,
         completed_at: datetime,
     ) -> RestoreResult:
@@ -391,7 +402,11 @@ class BackupImporter:
             raise BackupRestoreFailed("Another workspace restore is in progress")
         archive_path = Path(path)
         try:
-            validated = self._validate(archive_path, expected_workspace_owner_id)
+            validated = self._validate(
+                archive_path,
+                expected_workspace_owner_id,
+                expected_archive_backup_id,
+            )
         except BaseException:
             self.session.rollback()
             raise
@@ -468,14 +483,22 @@ class BackupImporter:
             .scalar_one()
         )
 
-    def _validate(self, path: Path, expected_workspace_owner_id: UUID) -> _ValidatedArchive:
+    def _validate(
+        self,
+        path: Path,
+        expected_workspace_owner_id: UUID,
+        expected_archive_backup_id: UUID | None = None,
+    ) -> _ValidatedArchive:
         self._validate_archive_file(path)
         try:
             with ZipFile(path) as archive:
                 entries = self._validate_entries(archive)
                 manifest = self._read_json(archive, entries["manifest.json"])
                 validated_manifest = self._validate_manifest(
-                    manifest, expected_workspace_owner_id, set(entries) - {"manifest.json"}
+                    manifest,
+                    expected_workspace_owner_id,
+                    set(entries) - {"manifest.json"},
+                    expected_archive_backup_id,
                 )
                 records = self._read_records(archive, entries, validated_manifest)
                 document_entries = self._validate_records(records, entries)
@@ -485,6 +508,7 @@ class BackupImporter:
                 raise
             raise UnsafeBackupArchive("Backup archive is invalid") from error
         return _ValidatedArchive(
+            backup_id=validated_manifest["backup_id"],
             created_at=validated_manifest["created_at"],
             schema_version=validated_manifest["schema_version"],
             app_version=validated_manifest["app_version"],
@@ -626,13 +650,21 @@ class BackupImporter:
             raise UnsafeBackupArchive("Backup JSON value type is unsupported")
 
     def _validate_manifest(
-        self, value: Any, expected_owner_id: UUID, entry_names: set[str]
+        self,
+        value: Any,
+        expected_owner_id: UUID,
+        entry_names: set[str],
+        expected_backup_id: UUID | None = None,
     ) -> dict[str, Any]:
         if not isinstance(value, dict) or set(value) != _MANIFEST_FIELDS:
             raise UnsafeBackupArchive("Backup manifest shape is invalid")
         if type(value["schema_version"]) is not int or value["schema_version"] != 1:
             raise UnsafeBackupArchive("Backup schema version is unsupported")
         backup_id = self._uuid(value["backup_id"])
+        if expected_backup_id is not None and backup_id != expected_backup_id:
+            raise UnsafeBackupArchive(
+                "Backup archive identity does not match trusted metadata"
+            )
         owner_id = self._uuid(value["owner_id"])
         if owner_id != expected_owner_id:
             raise UnsafeBackupArchive("Backup workspace owner does not match trusted metadata")

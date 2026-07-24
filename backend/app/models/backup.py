@@ -55,7 +55,12 @@ class GoogleDriveConnection(TimestampMixin, SQLModel, table=True):
     token_expires_at: datetime | None = Field(
         default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
     )
-    google_subject: str = Field(nullable=False, max_length=255)
+    google_subject: str = Field(
+        nullable=False,
+        max_length=255,
+        unique=True,
+        index=True,
+    )
     google_email: str = Field(nullable=False, max_length=255)
     granted_scopes: list[str] = Field(default_factory=list, sa_column=Column(JSONB, nullable=False))
     status: DriveConnectionStatus = Field(

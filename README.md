@@ -120,6 +120,8 @@ Local Docker uses Mailpit, so verification emails stay on the machine and can be
 
 Google Drive backup is optional and remains disabled when its credentials are blank. Cognolith requests only Google's [`drive.appdata`](https://developers.google.com/workspace/drive/api/guides/appdata) scope and stores snapshots in the hidden application-data folder. The app cannot browse or modify the user's normal Drive files, and snapshots do not appear in the standard Drive interface.
 
+A Google account may back one Cognolith account per installation; reconnecting that same Cognolith account on another installation remains supported.
+
 Configure Google OAuth:
 
 1. Create or select a project in [Google Cloud Console](https://console.cloud.google.com/).

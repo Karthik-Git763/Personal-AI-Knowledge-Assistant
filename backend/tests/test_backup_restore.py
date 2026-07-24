@@ -1015,8 +1015,17 @@ def test_restore_rechecks_document_checksum_while_staging(
     before = _snapshot_workspace(session, user.id)  # type: ignore[arg-type]
 
     class MutatingImporter(BackupImporter):
-        def _validate(self, path: Path, expected_workspace_owner_id: UUID) -> Any:
-            validated = super()._validate(path, expected_workspace_owner_id)
+        def _validate(
+            self,
+            path: Path,
+            expected_workspace_owner_id: UUID,
+            expected_archive_backup_id: UUID | None = None,
+        ) -> Any:
+            validated = super()._validate(
+                path,
+                expected_workspace_owner_id,
+                expected_archive_backup_id,
+            )
             with ZipFile(path) as source:
                 payloads = {
                     info.filename: source.read(info)
@@ -1250,11 +1259,19 @@ class CoordinatorImporter:
         self.session = session
         self.preview_owner_ids: list[UUID] = []
         self.restore_owner_ids: list[UUID] = []
+        self.preview_backup_ids: list[UUID | None] = []
+        self.restore_backup_ids: list[UUID | None] = []
         self.fail_restore = False
         self.reject_commit_after_restore = False
 
-    def preview(self, path: Path, expected_workspace_owner_id: UUID) -> BackupPreview:
+    def preview(
+        self,
+        path: Path,
+        expected_workspace_owner_id: UUID,
+        expected_archive_backup_id: UUID | None = None,
+    ) -> BackupPreview:
         self.preview_owner_ids.append(expected_workspace_owner_id)
+        self.preview_backup_ids.append(expected_archive_backup_id)
         return BackupPreview(
             created_at=datetime(2026, 7, 24, 12, 0, tzinfo=UTC),
             schema_version=1,
@@ -1270,10 +1287,12 @@ class CoordinatorImporter:
         user: User,
         expected_workspace_owner_id: UUID,
         *,
+        expected_archive_backup_id: UUID | None = None,
         operation: WorkspaceBackup,
         completed_at: datetime,
     ) -> RestoreResult:
         self.restore_owner_ids.append(expected_workspace_owner_id)
+        self.restore_backup_ids.append(expected_archive_backup_id)
         if self.fail_restore:
             raise BackupRestoreFailed("injected restore failure")
         operation.status = BackupStatus.completed
@@ -1297,13 +1316,15 @@ class CoordinatorExporter:
         self.now = now
         self.fail = fail
 
-    def export(self, user: User, destination: Path) -> BackupExportResult:
+    def export(
+        self, user: User, destination: Path, *, backup_id: UUID | None = None
+    ) -> BackupExportResult:
         if self.fail:
             raise RuntimeError("injected safety backup failure")
-        destination.write_bytes(b"safety archive")
+        destination.write_bytes(b"cognolith safety backup archive")
         manifest = BackupManifestV1(
             schema_version=1,
-            backup_id=uuid4(),
+            backup_id=backup_id or uuid4(),
             owner_id=user.portable_id,
             created_at=self.now,
             app_version="0.1.0",
@@ -1314,8 +1335,10 @@ class CoordinatorExporter:
         return BackupExportResult(
             path=destination,
             manifest=manifest,
-            archive_checksum=hashlib.sha256(b"safety archive").hexdigest(),
-            archive_size=len(b"safety archive"),
+            archive_checksum=hashlib.sha256(
+                b"cognolith safety backup archive"
+            ).hexdigest(),
+            archive_size=len(b"cognolith safety backup archive"),
         )
 
 
@@ -1396,7 +1419,7 @@ def coordinator_restore(
     )
     schedule = BackupSchedule(user_id=user.id, enabled=True)
     archive = tmp_path / "remote.zip"
-    archive.write_bytes(b"remote archive")
+    archive.write_bytes(b"cognolith remote backup archive")
     checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
     source = WorkspaceBackup(
         user_id=user.id,
@@ -1481,6 +1504,9 @@ async def test_preview_restore_uses_trusted_remote_workspace_owner(
     assert preview.schema_version == 1
     assert coordinator_restore["importer"].preview_owner_ids == [
         coordinator_restore["archive_owner_id"]
+    ]
+    assert coordinator_restore["importer"].preview_backup_ids == [
+        coordinator_restore["remote"].metadata.backup_id
     ]
     assert coordinator_restore["archive_owner_id"] != user.portable_id
     assert coordinator_restore["store"].listed_owner_ids == [
@@ -1615,6 +1641,9 @@ async def test_restore_creates_verified_safety_backup_and_separate_operation(
     assert coordinator_restore["importer"].restore_owner_ids == [
         coordinator_restore["archive_owner_id"]
     ]
+    assert coordinator_restore["importer"].restore_backup_ids == [
+        coordinator_restore["remote"].metadata.backup_id
+    ]
 
 
 @pytest.mark.asyncio
@@ -1723,7 +1752,7 @@ async def test_restore_commit_failure_rolls_back_workspace_and_marks_operation_f
                 connection.google_subject
             ),
             workspace_owner_id=restore_workspace["archive_owner_id"],
-            backup_id=uuid4(),
+            backup_id=source.backup_id,
             schema_version=1,
             archive_checksum=checksum,
             created_at=now,

@@ -4,7 +4,7 @@ from collections.abc import Iterable, Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from sqlmodel import Session, col, select
 
@@ -69,12 +69,18 @@ class BackupExporter:
     def validate_source_path(self, source: Path) -> Path:
         return validate_archive_path(self.upload_root, source)
 
-    def export(self, user: User, destination: Path) -> BackupExportResult:
+    def export(
+        self,
+        user: User,
+        destination: Path,
+        *,
+        backup_id: UUID | None = None,
+    ) -> BackupExportResult:
         if user.id is None:
             raise ValueError("Backup exports require a persisted user")
 
         default_folder = self._default_preference_folder(user.id)
-        backup_id = uuid4()
+        archive_backup_id = backup_id or uuid4()
         created_at = datetime.now(UTC)
         checksums: dict[str, str] = {}
         counts: dict[str, int] = {}
@@ -90,7 +96,7 @@ class BackupExporter:
                 self._write_document_files(archive, user.id, checksums)
                 manifest = BackupManifestV1(
                     schema_version=1,
-                    backup_id=backup_id,
+                    backup_id=archive_backup_id,
                     owner_id=user.portable_id,
                     created_at=created_at,
                     app_version=self.app_version,

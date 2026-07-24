@@ -25,6 +25,8 @@ from app.services.backup_store import BackupObjectMetadata, StoredBackup
 from app.services.google_drive_oauth import derive_drive_owner_id
 from app.services.google_drive_store import GoogleDriveReauthorizationRequiredError
 
+ARCHIVE_BYTES = b"cognolith-backup-archive"
+
 
 class RecordingExporter:
     def __init__(
@@ -36,14 +38,18 @@ class RecordingExporter:
         self.now = now
         self.failure = failure
         self.manifest_owner_id = manifest_owner_id
+        self.received_backup_ids: list[UUID | None] = []
 
-    def export(self, user: User, destination: Path) -> BackupExportResult:
+    def export(
+        self, user: User, destination: Path, *, backup_id: UUID | None = None
+    ) -> BackupExportResult:
+        self.received_backup_ids.append(backup_id)
         if self.failure is not None:
             raise self.failure
-        destination.write_bytes(b"backup-archive")
+        destination.write_bytes(ARCHIVE_BYTES)
         manifest = BackupManifestV1(
             schema_version=1,
-            backup_id=uuid4(),
+            backup_id=backup_id or uuid4(),
             owner_id=self.manifest_owner_id or user.portable_id,
             created_at=self.now,
             app_version="test",
@@ -144,14 +150,16 @@ class LifecycleExporter(RecordingExporter):
         self.user_id = user_id
         self.status_during_export: BackupStatus | str | None = None
 
-    def export(self, user: User, destination: Path) -> BackupExportResult:
+    def export(
+        self, user: User, destination: Path, *, backup_id: UUID | None = None
+    ) -> BackupExportResult:
         backup = self.session.exec(
             select(WorkspaceBackup)
             .where(WorkspaceBackup.user_id == self.user_id)
             .order_by(col(WorkspaceBackup.id).desc())
         ).one()
         self.status_during_export = backup.status
-        return super().export(user, destination)
+        return super().export(user, destination, backup_id=backup_id)
 
 
 class BlockingStore(RecordingStore):
@@ -223,10 +231,13 @@ async def test_successful_backup_commits_verified_metadata_and_schedule(
 
     assert result.status == BackupStatus.completed
     assert result.remote_file_id in store.remote_ids
-    assert result.archive_size_bytes == len(b"backup-archive")
+    assert result.archive_size_bytes == len(ARCHIVE_BYTES)
     assert result.checksum == "b" * 64
     assert result.item_counts == {"notes": 2}
     assert store.backups[0].metadata.workspace_owner_id == user.portable_id
+    assert store.backups[0].metadata.backup_id == result.backup_id
+    assert store.backups[0].metadata.app_version == "test"
+    assert store.backups[0].metadata.item_counts == {"notes": 2}
     assert store.backups[0].metadata.drive_owner_id == derive_drive_owner_id(
         connection.google_subject
     )
@@ -235,6 +246,54 @@ async def test_successful_backup_commits_verified_metadata_and_schedule(
     assert schedule.last_attempt_at == now
     assert schedule.last_success_at == now
     assert schedule.next_due_at == now + timedelta(hours=24)
+
+
+@pytest.mark.asyncio
+async def test_backup_uses_configured_interval_and_retention(
+    session: Session,
+    tmp_path: Path,
+    backup_workspace: tuple[User, GoogleDriveConnection, BackupSchedule],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user, connection, schedule = backup_workspace
+    now = datetime(2026, 7, 24, 13, 0, tzinfo=UTC)
+    monkeypatch.setattr(
+        "app.services.backup_coordinator.settings.BACKUP_INTERVAL_HOURS", 6
+    )
+    monkeypatch.setattr(
+        "app.services.backup_coordinator.settings.BACKUP_RETENTION_COUNT", 2
+    )
+    store = RecordingStore()
+    for index in range(2):
+        store.backups.append(
+            StoredBackup(
+                remote_id=f"configured-{index}",
+                name=f"configured-{index}.zip",
+                size=100,
+                created_at=now - timedelta(days=index + 1),
+                metadata=BackupObjectMetadata(
+                    drive_owner_id=derive_drive_owner_id(
+                        connection.google_subject
+                    ),
+                    workspace_owner_id=user.portable_id,
+                    backup_id=uuid4(),
+                    schema_version=1,
+                    archive_checksum=f"{index:064x}",
+                    created_at=now - timedelta(days=index + 1),
+                ),
+                completed=True,
+            )
+        )
+    coordinator = _coordinator(session, tmp_path, now, store)
+
+    await coordinator.run_backup_for_user(
+        user.id, BackupTrigger.manual  # type: ignore[arg-type]
+    )
+
+    session.refresh(schedule)
+    assert schedule.interval_hours == 6
+    assert schedule.next_due_at == now + timedelta(hours=6)
+    assert store.deleted == ["configured-1"]
 
 
 @pytest.mark.asyncio
@@ -294,7 +353,7 @@ async def test_failed_upload_preserves_existing_backups(
         StoredBackup(
             remote_id="previous-backup",
             name="previous.zip",
-            size=12,
+                size=100,
             created_at=now - timedelta(days=1),
             metadata=BackupObjectMetadata(
                 drive_owner_id=derive_drive_owner_id(connection.google_subject),
@@ -393,7 +452,7 @@ async def test_retention_failure_keeps_completed_backup_and_sanitizes_warning(
             StoredBackup(
                 remote_id=f"previous-{index}",
                 name=f"previous-{index}.zip",
-                size=12,
+                    size=100,
                 created_at=now - timedelta(days=index + 1),
                 metadata=BackupObjectMetadata(
                     drive_owner_id=derive_drive_owner_id(connection.google_subject),
@@ -472,7 +531,7 @@ async def test_successful_retention_keeps_the_newest_five_snapshots(
             StoredBackup(
                 remote_id=f"previous-{index}",
                 name=f"previous-{index}.zip",
-                size=12,
+                size=100,
                 created_at=now - timedelta(days=index + 1),
                 metadata=BackupObjectMetadata(
                     drive_owner_id=derive_drive_owner_id(connection.google_subject),

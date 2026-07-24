@@ -79,12 +79,15 @@ def _remote_backup(
     schema_version: int = 1,
     created_at: datetime | None = None,
     backup_id: UUID | None = None,
+    app_version: str | None = None,
+    item_counts: dict[str, int] | None = None,
+    size: int = 100,
 ) -> StoredBackup:
     timestamp = created_at or datetime(2026, 7, 24, 12, 0, tzinfo=UTC)
     return StoredBackup(
         remote_id=remote_id,
         name=f"cognolith-{remote_id}.zip",
-        size=100,
+        size=size,
         created_at=timestamp,
         metadata=BackupObjectMetadata(
             drive_owner_id=owner_id,
@@ -93,6 +96,8 @@ def _remote_backup(
             schema_version=schema_version,
             archive_checksum="a" * 64,
             created_at=timestamp,
+            app_version=app_version,
+            item_counts=item_counts or {},
         ),
         completed=completed,
     )
@@ -297,6 +302,7 @@ def test_callback_uses_state_binding_and_rejects_replay(session, monkeypatch) ->
     client, user = _authenticated_client(session)
     assert user.id is not None
     _configure_drive(monkeypatch)
+    monkeypatch.setattr(settings, "BACKUP_INTERVAL_HOURS", 6)
     raw_state = "state-value"
     session.add(
         OAuthState(
@@ -328,6 +334,10 @@ def test_callback_uses_state_binding_and_rejects_replay(session, monkeypatch) ->
 
     assert first.headers["location"].endswith("/dashboard/settings?drive=connected")
     assert replay.headers["location"].endswith("/dashboard/settings?drive=invalid_state")
+    schedule = session.exec(
+        select(BackupSchedule).where(BackupSchedule.user_id == user.id)
+    ).one()
+    assert schedule.interval_hours == 6
 
 
 def test_callback_never_redirects_to_provider_query_value(session, monkeypatch) -> None:
@@ -587,6 +597,8 @@ def test_backup_list_adopts_trusted_remote_snapshot_for_current_user(
         owner_id=owner_id,
         backup_id=backup_id,
         created_at=created_at,
+        app_version="0.1.0",
+        item_counts={"notes": 3, "documents": 2},
     )
 
     async def remote_backups(*_: object) -> list[StoredBackup]:
@@ -607,10 +619,13 @@ def test_backup_list_adopts_trusted_remote_snapshot_for_current_user(
     assert response.status_code == 200
     assert response.json()[0]["backup_id"] == str(backup_id)
     assert response.json()[0]["restore_eligible"] is True
+    assert response.json()[0]["app_version"] == "0.1.0"
+    assert response.json()[0]["item_counts"] == {"notes": 3, "documents": 2}
     assert adopted.remote_file_id == remote.remote_id
     assert adopted.schema_version == remote.metadata.schema_version
     assert adopted.checksum == remote.metadata.archive_checksum
     assert adopted.archive_size_bytes == remote.size
+    assert adopted.item_counts == {"notes": 3, "documents": 2}
     assert adopted.created_at == created_at.replace(tzinfo=None)
     assert adopted.completed_at == created_at
 
@@ -626,6 +641,8 @@ def test_status_adopts_remote_snapshot_once_across_repeated_requests(
         "idempotent-remote-id",
         owner_id=derive_drive_owner_id(connection.google_subject),
         backup_id=uuid4(),
+        app_version="0.1.0",
+        item_counts={"notes": 8},
     )
 
     async def remote_backups(*_: object) -> list[StoredBackup]:
@@ -647,6 +664,8 @@ def test_status_adopts_remote_snapshot_once_across_repeated_requests(
     assert first.status_code == 200
     assert second.status_code == 200
     assert first.json()["restore_points"][0]["restore_eligible"] is True
+    assert first.json()["restore_points"][0]["app_version"] == "0.1.0"
+    assert first.json()["restore_points"][0]["item_counts"] == {"notes": 8}
     assert second.json()["restore_points"][0]["restore_eligible"] is True
     assert len(adopted) == 1
 
@@ -694,6 +713,8 @@ def test_backup_list_never_adopts_untrusted_remote_objects(session, monkeypatch)
     owner_id = derive_drive_owner_id(connection.google_subject)
     incomplete = _remote_backup("incomplete-remote-id", owner_id=owner_id, completed=False)
     foreign = _remote_backup("foreign-remote-id", owner_id=uuid4())
+    empty = _remote_backup("empty-remote-id", owner_id=owner_id, size=0)
+    truncated = _remote_backup("truncated-remote-id", owner_id=owner_id, size=21)
     malformed = StoredBackup(
         remote_id="malformed-remote-id",
         name="cognolith-malformed.zip",
@@ -711,7 +732,7 @@ def test_backup_list_never_adopts_untrusted_remote_objects(session, monkeypatch)
     )
 
     async def remote_backups(*_: object) -> list[StoredBackup]:
-        return [incomplete, foreign, malformed]
+        return [incomplete, foreign, empty, truncated, malformed]
 
     monkeypatch.setattr("app.api.routes.backups._trusted_remote_backups", remote_backups)
     try:

@@ -113,6 +113,31 @@ def test_preview_returns_only_safe_metadata(
     assert not (tmp_path / "backup-temp").exists()
 
 
+def test_preview_rejects_archive_identity_mismatch(
+    importer: BackupImporter, tmp_path: Path, owner_id: UUID
+) -> None:
+    archive_backup_id = uuid4()
+    archive = _write_archive(
+        tmp_path / "identity-mismatch.zip",
+        owner_id=owner_id,
+        manifest_updates={"backup_id": str(archive_backup_id)},
+    )
+
+    with pytest.raises(UnsafeBackupArchive, match="identity"):
+        importer.preview(
+            archive,
+            expected_workspace_owner_id=owner_id,
+            expected_archive_backup_id=uuid4(),
+        )
+
+    preview = importer.preview(
+        archive,
+        expected_workspace_owner_id=owner_id,
+        expected_archive_backup_id=archive_backup_id,
+    )
+    assert preview.schema_version == 1
+
+
 @pytest.mark.parametrize(
     "entry_name",
     [

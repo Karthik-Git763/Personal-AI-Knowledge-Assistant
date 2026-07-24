@@ -4,7 +4,7 @@ import os
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any, BinaryIO, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 from zipfile import ZipFile
 
 import pytest
@@ -133,6 +133,21 @@ def test_export_contains_durable_records_and_original_file(
         assert manifest["app_version"] == "test-version"
         assert any(name.startswith("files/documents/") for name in archive.namelist())
         assert "document_chunks.json" not in archive.namelist()
+
+
+def test_export_uses_supplied_archive_identity(
+    populated_workspace: tuple[User, Path], exporter: BackupExporter, tmp_path: Path
+) -> None:
+    user, _ = populated_workspace
+    expected_backup_id = uuid4()
+
+    result = exporter.export(
+        user,
+        tmp_path / "identity.zip",
+        backup_id=expected_backup_id,
+    )
+
+    assert result.manifest.backup_id == expected_backup_id
 
 
 def test_export_uses_portable_uuid_relationships_and_excludes_derived_content(

@@ -1,5 +1,6 @@
 from typing import cast
 
+import pytest
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
@@ -34,10 +35,14 @@ def _alembic_config() -> Config:
     return config
 
 
-def test_google_drive_backup_foundation_is_the_migration_head() -> None:
+def test_google_drive_subject_ownership_is_the_migration_head() -> None:
     script = ScriptDirectory.from_config(_alembic_config())
 
-    assert script.get_current_head() == "0005_google_drive_backup_foundation"
+    assert script.get_current_head() == "0006_unique_google_drive_subject"
+    assert (
+        script.get_revision("0006_unique_google_drive_subject").down_revision
+        == "0005_google_drive_backup_foundation"
+    )
     assert script.get_revision("0005_google_drive_backup_foundation").down_revision == "0004_streaming_chat"
 
 
@@ -173,6 +178,13 @@ def test_google_drive_backup_upgrade_creates_schema() -> None:
     connection_status_type = cast(String, connection_columns["status"]["type"])
     assert connection_status_type.length is not None
     assert connection_status_type.length >= len("reauthorization_required")
+    connection_indexes = {
+        index["name"]: index
+        for index in inspector.get_indexes("google_drive_connections")
+    }
+    assert connection_indexes[
+        "ix_google_drive_connections_google_subject"
+    ]["unique"] is True
     backup_columns = {column["name"]: column for column in inspector.get_columns("workspace_backups")}
     assert backup_columns["backup_id"]["nullable"] is False
     assert backup_columns["operation_kind"]["nullable"] is False
@@ -208,3 +220,61 @@ def test_google_drive_backup_upgrade_creates_schema() -> None:
             )
         ).scalar_one() == 64
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0004_streaming_chat"
+
+
+def test_google_drive_subject_migration_rejects_existing_duplicates() -> None:
+    config = _alembic_config()
+    SQLModel.metadata.drop_all(engine)
+    with engine.begin() as connection:
+        connection.execute(text("DROP TABLE IF EXISTS alembic_version"))
+    command.upgrade(config, "0005_google_drive_backup_foundation")
+
+    with engine.begin() as connection:
+        user_ids = connection.execute(
+            text(
+                """
+                INSERT INTO users (
+                    portable_id, email, is_active, is_superuser, created_at,
+                    updated_at, hashed_password, is_verified, is_deleted
+                ) VALUES
+                    (gen_random_uuid(), 'first-owner@example.com', true, false,
+                     CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 'hashed', true, false),
+                    (gen_random_uuid(), 'second-owner@example.com', true, false,
+                     CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 'hashed', true, false)
+                RETURNING id
+                """
+            )
+        ).scalars().all()
+        for index, user_id in enumerate(user_ids):
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO google_drive_connections (
+                        user_id, encrypted_refresh_token, google_subject,
+                        google_email, granted_scopes, status, connected_at,
+                        created_at, updated_at
+                    ) VALUES (
+                        :user_id, :token, 'duplicate-subject', :email,
+                        '[]'::jsonb, 'connected', CURRENT_TIMESTAMP,
+                        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    )
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "token": b"encrypted",
+                    "email": f"owner-{index}@example.com",
+                },
+            )
+
+    with pytest.raises(RuntimeError, match="duplicate Google subjects"):
+        command.upgrade(config, "head")
+
+    with engine.connect() as connection:
+        assert (
+            connection.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one()
+            == "0005_google_drive_backup_foundation"
+        )
+    command.downgrade(config, "0004_streaming_chat")

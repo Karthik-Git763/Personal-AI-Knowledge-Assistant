@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 from uuid import UUID
+
+MINIMUM_BACKUP_ARCHIVE_SIZE = 22
 
 
 @dataclass(frozen=True)
@@ -16,6 +18,8 @@ class BackupObjectMetadata:
     schema_version: int
     archive_checksum: str
     created_at: datetime
+    app_version: str | None = None
+    item_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -53,6 +57,7 @@ def is_valid_stored_backup(backup: StoredBackup, drive_owner_id: UUID) -> bool:
     return (
         is_trusted_stored_backup(backup, drive_owner_id)
         and backup.completed
+        and backup.size >= MINIMUM_BACKUP_ARCHIVE_SIZE
     )
 
 

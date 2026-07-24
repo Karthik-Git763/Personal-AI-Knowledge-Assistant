@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import tempfile
@@ -56,6 +57,21 @@ class GoogleDriveStore:
     _CHUNK_SIZE = 64 * 1024
     _REMOTE_ID = re.compile(r"[A-Za-z0-9_-]{10,200}")
     _CHECKSUM = re.compile(r"[0-9a-f]{64}")
+    _APP_VERSION = re.compile(r"[\x21-\x7e]{1,64}")
+    _COUNT_ALIASES = {
+        "n": "notes",
+        "f": "folders",
+        "t": "tags",
+        "r": "note_tag_relations",
+        "l": "links",
+        "p": "templates",
+        "d": "documents",
+        "s": "chat_sessions",
+        "m": "chat_messages",
+        "u": "user_preferences",
+    }
+    _COUNT_KEYS = {value: key for key, value in _COUNT_ALIASES.items()}
+    _MAX_ITEM_COUNTS_PROPERTY_LENGTH = 124
     _FIELDS = "id,name,size,createdTime,parents,appProperties"
 
     def __init__(
@@ -337,6 +353,8 @@ class GoogleDriveStore:
         checksum = self._required_string(properties, "archive_checksum")
         if not self._CHECKSUM.fullmatch(checksum):
             raise GoogleDriveMalformedPayloadError("Google Drive backup checksum is invalid")
+        app_version = self._optional_app_version(properties.get("app_version"))
+        item_counts = self._optional_item_counts(properties.get("item_counts"))
         return BackupObjectMetadata(
             drive_owner_id=drive_owner_id,
             workspace_owner_id=workspace_owner_id,
@@ -344,10 +362,12 @@ class GoogleDriveStore:
             schema_version=int(raw_schema_version),
             archive_checksum=checksum,
             created_at=self._parse_datetime(self._required_string(properties, "created_at")),
+            app_version=app_version,
+            item_counts=item_counts,
         )
 
     def _app_properties(self, metadata: BackupObjectMetadata, *, completed: bool) -> dict[str, str]:
-        return {
+        properties = {
             "cognolith": "backup",
             "drive_owner_id": str(metadata.drive_owner_id),
             "workspace_owner_id": str(metadata.workspace_owner_id),
@@ -357,6 +377,19 @@ class GoogleDriveStore:
             "created_at": metadata.created_at.astimezone(UTC).isoformat().replace("+00:00", "Z"),
             "completed": str(completed).lower(),
         }
+        if metadata.app_version is not None:
+            properties["app_version"] = metadata.app_version
+        if metadata.item_counts:
+            compact_counts = {
+                self._COUNT_KEYS[key]: value
+                for key, value in metadata.item_counts.items()
+            }
+            properties["item_counts"] = json.dumps(
+                compact_counts,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        return properties
 
     @classmethod
     def _list_query(cls, drive_owner_id: UUID) -> str:
@@ -401,6 +434,83 @@ class GoogleDriveStore:
             raise ValueError("Backup metadata is invalid")
         if metadata.created_at.tzinfo is None or metadata.created_at.utcoffset() is None:
             raise ValueError("Backup metadata timestamp must include a timezone")
+        if (
+            metadata.app_version is not None
+            and not self._APP_VERSION.fullmatch(metadata.app_version)
+        ):
+            raise ValueError("Backup metadata app version is invalid")
+        self._validate_item_counts(metadata.item_counts, ValueError)
+
+    def _optional_app_version(self, value: object) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str) or not self._APP_VERSION.fullmatch(value):
+            raise GoogleDriveMalformedPayloadError(
+                "Google Drive backup app version is invalid"
+            )
+        return value
+
+    def _optional_item_counts(self, value: object) -> dict[str, int]:
+        if value is None:
+            return {}
+        if (
+            not isinstance(value, str)
+            or len(value) > self._MAX_ITEM_COUNTS_PROPERTY_LENGTH
+        ):
+            raise GoogleDriveMalformedPayloadError(
+                "Google Drive backup item counts are invalid"
+            )
+        try:
+            compact = json.loads(value, object_pairs_hook=self._unique_json_object)
+        except (json.JSONDecodeError, ValueError) as error:
+            raise GoogleDriveMalformedPayloadError(
+                "Google Drive backup item counts are invalid"
+            ) from error
+        if not isinstance(compact, dict) or any(
+            key not in self._COUNT_ALIASES for key in compact
+        ):
+            raise GoogleDriveMalformedPayloadError(
+                "Google Drive backup item counts are invalid"
+            )
+        counts = {
+            self._COUNT_ALIASES[key]: count for key, count in compact.items()
+        }
+        self._validate_item_counts(
+            counts,
+            GoogleDriveMalformedPayloadError,
+        )
+        return counts
+
+    def _validate_item_counts(
+        self,
+        counts: Mapping[str, object],
+        error_type: type[ValueError] | type[GoogleDriveMalformedPayloadError],
+    ) -> None:
+        if (
+            len(counts) > len(self._COUNT_KEYS)
+            or any(key not in self._COUNT_KEYS for key in counts)
+            or any(
+                type(count) is not int or count < 0 or count > 2_147_483_647
+                for count in counts.values()
+            )
+        ):
+            raise error_type("Google Drive backup item counts are invalid")
+        encoded = json.dumps(
+            {self._COUNT_KEYS[key]: count for key, count in counts.items()},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(encoded) > self._MAX_ITEM_COUNTS_PROPERTY_LENGTH:
+            raise error_type("Google Drive backup item counts are invalid")
+
+    @staticmethod
+    def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        output: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in output:
+                raise ValueError("Duplicate item count key")
+            output[key] = value
+        return output
 
     def _require_trusted_remote_id(self, remote_id: str) -> None:
         self._validate_remote_id(remote_id)

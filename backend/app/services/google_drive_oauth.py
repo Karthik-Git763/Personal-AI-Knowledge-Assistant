@@ -7,6 +7,7 @@ from urllib.parse import urlencode
 from uuid import UUID, uuid5
 
 import httpx
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from app.core.config import Settings
@@ -28,6 +29,10 @@ class InvalidOAuthState(ValueError):  # noqa: N818
 
 class GoogleDriveOAuthError(RuntimeError):
     """Raised for OAuth failures without provider payload details."""
+
+
+class GoogleDriveAccountInUseError(GoogleDriveOAuthError):
+    """Raised when a Google identity belongs to another local Cognolith user."""
 
 
 class GoogleDriveOAuthRetryableError(GoogleDriveOAuthError):
@@ -139,6 +144,16 @@ class GoogleDriveOAuthService:
         google_email = self._required_string(
             identity_payload, "email", "Google Drive identity could not be verified"
         )
+        subject_owner = self.session.exec(
+            select(GoogleDriveConnection).where(
+                GoogleDriveConnection.google_subject == google_subject,
+                GoogleDriveConnection.user_id != user_id,
+            )
+        ).first()
+        if subject_owner is not None:
+            raise GoogleDriveAccountInUseError(
+                "Google Drive account is already connected"
+            )
         connection = self.session.exec(
             select(GoogleDriveConnection)
             .where(GoogleDriveConnection.user_id == user_id)
@@ -177,7 +192,20 @@ class GoogleDriveOAuthService:
             connection.status = DriveConnectionStatus.connected
             connection.disconnected_at = None
         self.session.add(connection)
-        self.session.commit()
+        try:
+            self.session.commit()
+        except IntegrityError as error:
+            self.session.rollback()
+            constraint_name = getattr(
+                getattr(error.orig, "diag", None),
+                "constraint_name",
+                None,
+            )
+            if constraint_name == "ix_google_drive_connections_google_subject":
+                raise GoogleDriveAccountInUseError(
+                    "Google Drive account is already connected"
+                ) from error
+            raise
         self.session.refresh(connection)
         return connection
 

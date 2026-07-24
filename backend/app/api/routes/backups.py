@@ -37,11 +37,13 @@ from app.schemas.backup import (
 from app.schemas.error import ErrorCode
 from app.services.backup_coordinator import BackupCoordinator, BackupPreconditionError
 from app.services.backup_store import (
+    MINIMUM_BACKUP_ARCHIVE_SIZE,
     StoredBackup,
     is_trusted_stored_backup,
     is_valid_stored_backup,
 )
 from app.services.google_drive_oauth import (
+    GoogleDriveAccountInUseError,
     GoogleDriveOAuthError,
     GoogleDriveOAuthReauthorizationRequiredError,
     GoogleDriveOAuthRetryableError,
@@ -64,6 +66,7 @@ class BackupApiErrorCode(StrEnum):
     drive_not_configured = "GOOGLE_DRIVE_NOT_CONFIGURED"
     reauthorization_required = "GOOGLE_DRIVE_REAUTHORIZATION_REQUIRED"
     provider_retryable = "GOOGLE_DRIVE_RETRYABLE"
+    drive_account_in_use = "GOOGLE_DRIVE_ACCOUNT_IN_USE"
 
 
 def _error(message: str, code: BackupApiErrorCode, http_status: int) -> AppError:
@@ -86,7 +89,11 @@ def _current_user_id(current_user: User) -> int:
 
 
 def _operation_response(
-    backup: WorkspaceBackup, *, restore_eligible: bool = False
+    backup: WorkspaceBackup,
+    *,
+    restore_eligible: bool = False,
+    app_version: str | None = None,
+    item_counts: dict[str, int] | None = None,
 ) -> WorkspaceBackupResponse:
     return WorkspaceBackupResponse(
         backup_id=backup.backup_id,
@@ -95,8 +102,9 @@ def _operation_response(
         status=backup.status,
         trigger=backup.trigger,
         schema_version=backup.schema_version,
+        app_version=app_version,
         archive_size_bytes=backup.archive_size_bytes,
-        item_counts=backup.item_counts,
+        item_counts=item_counts if item_counts is not None else backup.item_counts,
         started_at=backup.started_at,
         completed_at=backup.completed_at,
         failure_message=backup.failure_message,
@@ -116,7 +124,35 @@ def _connection(session: SessionDep, user_id: int) -> GoogleDriveConnection:
             BackupApiErrorCode.reauthorization_required,
             status.HTTP_403_FORBIDDEN,
         )
+    _require_exclusive_connection(session, user_id, connection)
     return connection
+
+
+def _require_exclusive_connection(
+    session: SessionDep,
+    user_id: int,
+    connection: GoogleDriveConnection,
+) -> None:
+    active_connections = session.exec(
+        select(GoogleDriveConnection)
+        .where(
+            GoogleDriveConnection.google_subject == connection.google_subject,
+            col(GoogleDriveConnection.status).in_(
+                [
+                    DriveConnectionStatus.connected,
+                    DriveConnectionStatus.reauthorization_required,
+                ]
+            ),
+        )
+        .order_by(col(GoogleDriveConnection.id))
+    ).all()
+    owner = active_connections[0] if active_connections else None
+    if owner is not None and owner.user_id != user_id:
+        raise _error(
+            "This Google Drive account is already connected to another local user.",
+            BackupApiErrorCode.drive_account_in_use,
+            status.HTTP_409_CONFLICT,
+        )
 
 
 def _store(session: SessionDep, connection: GoogleDriveConnection) -> GoogleDriveStore:
@@ -136,6 +172,12 @@ def _map_drive_error(error: Exception) -> AppError:
         return AppError(
             "Backup prerequisites are unavailable.",
             ErrorCode.CONFLICT,
+            status.HTTP_409_CONFLICT,
+        )
+    if isinstance(error, GoogleDriveAccountInUseError):
+        return _error(
+            "This Google Drive account is already connected to another local user.",
+            BackupApiErrorCode.drive_account_in_use,
             status.HTTP_409_CONFLICT,
         )
     if isinstance(
@@ -222,7 +264,7 @@ def _adopt_remote_backups(
                 schema_version=remote.metadata.schema_version,
                 archive_size_bytes=remote.size,
                 checksum=remote.metadata.archive_checksum,
-                item_counts={},
+                item_counts=dict(remote.metadata.item_counts),
                 started_at=timestamp,
                 completed_at=timestamp,
                 created_at=timestamp,
@@ -255,6 +297,7 @@ def _restore_eligible(backup: WorkspaceBackup, remote: StoredBackup) -> bool:
         and backup.status == BackupStatus.completed
         and backup.backup_id == remote.metadata.backup_id
         and backup.remote_file_id == remote.remote_id
+        and remote.size >= MINIMUM_BACKUP_ARCHIVE_SIZE
         and backup.schema_version in _SUPPORTED_RESTORE_SCHEMA_VERSIONS
         and remote.completed
         and remote.metadata.schema_version == backup.schema_version
@@ -318,16 +361,24 @@ async def google_drive_callback(
             schedule = BackupSchedule(
                 user_id=state_record.user_id,
                 enabled=True,
-                interval_hours=24,
-                next_due_at=datetime.now(UTC) + timedelta(hours=24),
+                interval_hours=settings.BACKUP_INTERVAL_HOURS,
+                next_due_at=datetime.now(UTC)
+                + timedelta(hours=settings.BACKUP_INTERVAL_HOURS),
             )
         else:
             schedule.enabled = True
-            schedule.interval_hours = 24
+            schedule.interval_hours = settings.BACKUP_INTERVAL_HOURS
             if schedule.next_due_at is None:
-                schedule.next_due_at = datetime.now(UTC) + timedelta(hours=24)
+                schedule.next_due_at = datetime.now(UTC) + timedelta(
+                    hours=settings.BACKUP_INTERVAL_HOURS
+                )
         session.add(schedule)
         session.commit()
+    except GoogleDriveAccountInUseError:
+        return RedirectResponse(
+            f"{frontend_settings}?drive=account_in_use",
+            status_code=303,
+        )
     except (InvalidOAuthState, GoogleDriveOAuthError):
         return RedirectResponse(f"{frontend_settings}?drive=authorization_failed", status_code=303)
     except Exception:
@@ -364,6 +415,7 @@ async def google_drive_status(
 
     restore_points: list[RestorePointSummary] = []
     if connection is not None and connection.status == DriveConnectionStatus.connected:
+        _require_exclusive_connection(session, user_id, connection)
         remote_backups = await _trusted_remote_backups(session, current_user, connection)
         owner_id = derive_drive_owner_id(connection.google_subject)
         local_by_remote = _adopt_remote_backups(
@@ -376,9 +428,11 @@ async def google_drive_status(
                     RestorePointSummary(
                         backup_id=local.backup_id,
                         schema_version=remote.metadata.schema_version,
+                        app_version=remote.metadata.app_version,
                         archive_size_bytes=remote.size,
                         created_at=remote.metadata.created_at,
                         restore_eligible=_restore_eligible(local, remote),
+                        item_counts=dict(remote.metadata.item_counts),
                     )
                 )
 
@@ -461,6 +515,8 @@ async def list_backups(session: SessionDep, current_user: CurrentUser) -> list[W
         _operation_response(
             local_by_remote[remote.remote_id],
             restore_eligible=_restore_eligible(local_by_remote[remote.remote_id], remote),
+            app_version=remote.metadata.app_version,
+            item_counts=dict(remote.metadata.item_counts),
         )
         for remote in sorted(remote_backups, key=lambda backup: backup.created_at, reverse=True)
         if remote.remote_id in local_by_remote
