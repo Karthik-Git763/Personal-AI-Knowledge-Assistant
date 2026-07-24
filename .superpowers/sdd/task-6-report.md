@@ -126,3 +126,65 @@ Rechecked lock acquisition and release, crash-journal visibility, transaction
 commit ordering, coordinator failure marking, descriptor lifetime, EXDEV copy
 behavior, symlink confinement, raw ZIP-name validation, and preview mutation
 boundaries. No unresolved findings remain.
+
+## Final Important Review Fixes
+
+Status: Complete.
+
+Review-fix base SHA: `7cf821b0e617fb8f8f070bb2afff1b195e03a0d1`
+
+Implementation commit: the commit containing this report section.
+
+### Changes
+
+- Made recovery-journal creation power-loss durable by fsyncing the journal file
+  and its parent directory before any final file placement.
+- Made every final document placement durable before the database commit by
+  reopening and fsyncing the placed file and then fsyncing its validated parent
+  directory. This applies after same-device rename, exclusive EXDEV copy, and
+  injected move implementations.
+- Limited ignored directory-fsync failures to documented unsupported errnos:
+  `EINVAL`, `ENOTSUP`, and `EOPNOTSUPP`, plus Windows-only `EACCES` and `EPERM`.
+  Other I/O failures continue to abort and roll back the restore.
+- Made post-commit old-file cleanup explicitly best-effort across surviving-path
+  database lookup, upload-root resolution, and unlink failures. Failures are
+  logged with a fixed message and exception type only, failed cleanup
+  transactions are reset, and the committed restore operation remains
+  completed.
+
+### TDD Evidence
+
+RED:
+
+- The durability ordering regression observed only two file fsyncs and no
+  directory fsyncs before commit; the injected second-directory `EIO` never
+  fired. Result: `2 failed, 26 deselected in 2.99s`.
+- The post-commit cleanup regressions showed query and root-resolution failures
+  escaping after commit and unlink failure remaining unrecorded. Result:
+  `3 failed, 28 deselected in 4.56s`.
+
+GREEN:
+
+- Durability ordering and pre-commit failure regressions:
+  `2 passed, 26 deselected in 2.84s`.
+- Query, root-resolution, and unlink cleanup regressions:
+  `3 passed, 28 deselected in 7.56s`.
+- Unsupported-directory-fsync regression:
+  `1 passed, 31 deselected in 1.73s`.
+- `docker compose exec backend pytest -q tests/test_backup_importer.py tests/test_backup_restore.py tests/test_backup_coordinator.py`
+  - `80 passed in 40.59s`
+- `docker compose exec backend ruff check app/services/backup_importer.py app/services/backup_coordinator.py tests/test_backup_importer.py tests/test_backup_restore.py tests/test_backup_coordinator.py`
+  - `All checks passed!`
+- `docker compose exec backend basedpyright app/services/backup_importer.py app/services/backup_coordinator.py tests/test_backup_importer.py tests/test_backup_restore.py tests/test_backup_coordinator.py`
+  - `0 errors, 0 warnings, 0 notes`
+
+### Self-review
+
+Rechecked journal durability ordering, descriptor lifetimes, same-device rename
+and EXDEV copy synchronization, unsupported directory-fsync errno handling,
+pre-commit rollback cleanup, post-commit transaction reset, sanitized logging,
+and completed-operation preservation. No unresolved findings remain.
+
+### Concerns
+
+None identified.

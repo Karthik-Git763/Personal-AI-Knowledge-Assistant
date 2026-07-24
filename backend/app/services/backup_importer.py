@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import logging
 import math
 import os
 import shutil
@@ -48,6 +49,8 @@ from app.models.user import (
 )
 from app.schemas.backup import BackupPreview, RestoreResult
 from app.services.backup_exporter import RECORD_FILENAMES
+
+logger = logging.getLogger(__name__)
 
 
 class UnsafeBackupArchiveError(RuntimeError):
@@ -916,8 +919,7 @@ class BackupImporter:
             for identifier in validated.document_entries
         }
 
-    @staticmethod
-    def _write_recovery_journal(journal: Path, paths: list[Path]) -> None:
+    def _write_recovery_journal(self, journal: Path, paths: list[Path]) -> None:
         payload = json.dumps(
             {"created_paths": [str(path.absolute()) for path in paths]},
             sort_keys=True,
@@ -927,6 +929,7 @@ class BackupImporter:
             output.write(payload)
             output.flush()
             os.fsync(output.fileno())
+        self._fsync_directory(journal.parent)
 
     def _move_staged_documents(
         self,
@@ -942,6 +945,7 @@ class BackupImporter:
                     self._replace_file(source, opened)
                 else:
                     self.move_file(source, opened.path)
+                self._fsync_final_destination(opened)
             finally:
                 os.close(opened.descriptor)
                 if opened.parent_descriptor is not None:
@@ -1082,6 +1086,61 @@ class BackupImporter:
                 output.flush()
                 os.fsync(output.fileno())
             source.unlink()
+
+    def _fsync_final_destination(
+        self, destination: _OpenedDestination
+    ) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        if destination.parent_descriptor is None:
+            descriptor = os.open(destination.path, flags)
+        else:
+            descriptor = os.open(
+                destination.path.name,
+                flags,
+                dir_fd=destination.parent_descriptor,
+            )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+        if destination.parent_descriptor is None:
+            self._fsync_directory(destination.path.parent)
+        else:
+            self._fsync_directory_descriptor(
+                destination.parent_descriptor
+            )
+
+    def _fsync_directory(self, directory: Path) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        try:
+            descriptor = os.open(directory, flags)
+        except OSError as error:
+            if self._directory_fsync_is_unsupported(error):
+                return
+            raise
+        try:
+            self._fsync_directory_descriptor(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _fsync_directory_descriptor(self, descriptor: int) -> None:
+        try:
+            os.fsync(descriptor)
+        except OSError as error:
+            if not self._directory_fsync_is_unsupported(error):
+                raise
+
+    @staticmethod
+    def _directory_fsync_is_unsupported(error: OSError) -> bool:
+        unsupported = {
+            errno.EINVAL,
+            getattr(errno, "ENOTSUP", errno.EINVAL),
+            getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+        }
+        if os.name == "nt":
+            unsupported.update({errno.EACCES, errno.EPERM})
+        return error.errno in unsupported
 
     def _old_document_paths(self, user_id: int) -> list[str]:
         if self.session is None:
@@ -1503,7 +1562,27 @@ class BackupImporter:
 
     def _delete_old_files(self, paths: list[str]) -> None:
         for value in set(paths):
-            self._delete_if_unreferenced(Path(value))
+            try:
+                self._delete_if_unreferenced(Path(value))
+            except Exception as error:
+                logger.warning(
+                    "Post-restore old-file cleanup failed",
+                    extra={
+                        "cleanup_error_type": type(error).__name__,
+                    },
+                )
+                if self.session is not None:
+                    try:
+                        self.session.rollback()
+                    except Exception as rollback_error:
+                        logger.warning(
+                            "Post-restore cleanup session reset failed",
+                            extra={
+                                "cleanup_error_type": (
+                                    type(rollback_error).__name__
+                                ),
+                            },
+                        )
 
     def _delete_if_unreferenced(self, path: Path) -> None:
         if self.session is None:
@@ -1516,10 +1595,7 @@ class BackupImporter:
             self._resolved_upload_path(Path(value)) == confined
             for value in surviving_paths
         ):
-            try:
-                confined.unlink()
-            except OSError:
-                return
+            confined.unlink()
 
     def _confined_regular_file(self, path: Path) -> Path | None:
         root = self.upload_root.resolve()

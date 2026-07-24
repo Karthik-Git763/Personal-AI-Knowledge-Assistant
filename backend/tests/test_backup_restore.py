@@ -3,6 +3,8 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import os
+import stat
 from collections.abc import Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -639,6 +641,274 @@ def test_post_commit_journal_cleanup_failure_keeps_completed_restore(
     restored = session.get(Document, result.reprocessing_document_ids[0])
     assert restored is not None
     assert Path(restored.file_path).read_bytes() == b"restored document"
+
+
+def test_post_commit_old_file_query_failure_is_logged_and_restore_stays_completed(
+    session: Session,
+    restore_workspace: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    user: User = restore_workspace["user"]
+    assert user.id is not None
+    operation = _pending_restore_operation(session, user.id)
+    original_exec = session.exec
+    restore_committed = False
+
+    def mark_restore_committed(database_session: Session) -> None:
+        nonlocal restore_committed
+        restore_committed = True
+
+    def fail_cleanup_query(*args: Any, **kwargs: Any) -> Any:
+        if restore_committed:
+            raise RuntimeError("sensitive injected query detail")
+        return original_exec(*args, **kwargs)
+
+    event.listen(session, "after_commit", mark_restore_committed, once=True)
+    monkeypatch.setattr(session, "exec", fail_cleanup_query)
+
+    with caplog.at_level(
+        "WARNING", logger="app.services.backup_importer"
+    ):
+        result = _importer(session, restore_workspace).restore(
+            restore_workspace["archive"],
+            user,
+            expected_workspace_owner_id=restore_workspace["archive_owner_id"],
+            operation=operation,
+            completed_at=datetime(2026, 7, 24, 14, 0, tzinfo=UTC),
+        )
+
+    assert len(result.reprocessing_document_ids) == 1
+    with Session(engine) as verification_session:
+        persisted = verification_session.get(WorkspaceBackup, operation.id)
+        assert persisted is not None
+        assert persisted.status == BackupStatus.completed
+    assert restore_workspace["old_file"].exists()
+    record = next(
+        record
+        for record in caplog.records
+        if record.name == "app.services.backup_importer"
+    )
+    assert record.getMessage() == "Post-restore old-file cleanup failed"
+    assert record.__dict__["cleanup_error_type"] == "RuntimeError"
+    assert "sensitive injected query detail" not in caplog.text
+
+
+def test_post_commit_old_file_root_failure_is_logged_and_restore_stays_completed(
+    session: Session,
+    restore_workspace: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    user: User = restore_workspace["user"]
+    assert user.id is not None
+    operation = _pending_restore_operation(session, user.id)
+    original_resolve = Path.resolve
+    restore_committed = False
+
+    def mark_restore_committed(database_session: Session) -> None:
+        nonlocal restore_committed
+        restore_committed = True
+
+    def fail_upload_root_resolve(
+        path: Path, *args: Any, **kwargs: Any
+    ) -> Path:
+        if restore_committed and path == restore_workspace["upload_root"]:
+            raise OSError(errno.EIO, "sensitive injected root detail")
+        return original_resolve(path, *args, **kwargs)
+
+    event.listen(session, "after_commit", mark_restore_committed, once=True)
+    monkeypatch.setattr(Path, "resolve", fail_upload_root_resolve)
+
+    with caplog.at_level(
+        "WARNING", logger="app.services.backup_importer"
+    ):
+        result = _importer(session, restore_workspace).restore(
+            restore_workspace["archive"],
+            user,
+            expected_workspace_owner_id=restore_workspace["archive_owner_id"],
+            operation=operation,
+            completed_at=datetime(2026, 7, 24, 14, 0, tzinfo=UTC),
+        )
+
+    assert len(result.reprocessing_document_ids) == 1
+    with Session(engine) as verification_session:
+        persisted = verification_session.get(WorkspaceBackup, operation.id)
+        assert persisted is not None
+        assert persisted.status == BackupStatus.completed
+    assert restore_workspace["old_file"].exists()
+    record = next(
+        record
+        for record in caplog.records
+        if record.name == "app.services.backup_importer"
+    )
+    assert record.getMessage() == "Post-restore old-file cleanup failed"
+    assert record.__dict__["cleanup_error_type"] == "OSError"
+    assert "sensitive injected root detail" not in caplog.text
+
+
+def test_post_commit_old_file_unlink_failure_is_logged_and_restore_stays_completed(
+    session: Session,
+    restore_workspace: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    user: User = restore_workspace["user"]
+    assert user.id is not None
+    operation = _pending_restore_operation(session, user.id)
+    old_file: Path = restore_workspace["old_file"]
+    original_unlink = Path.unlink
+
+    def fail_old_file_unlink(
+        path: Path, *args: Any, **kwargs: Any
+    ) -> None:
+        if path == old_file:
+            raise OSError(errno.EACCES, "sensitive injected unlink detail")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_old_file_unlink)
+
+    with caplog.at_level(
+        "WARNING", logger="app.services.backup_importer"
+    ):
+        result = _importer(session, restore_workspace).restore(
+            restore_workspace["archive"],
+            user,
+            expected_workspace_owner_id=restore_workspace["archive_owner_id"],
+            operation=operation,
+            completed_at=datetime(2026, 7, 24, 14, 0, tzinfo=UTC),
+        )
+
+    assert len(result.reprocessing_document_ids) == 1
+    session.refresh(operation)
+    assert operation.status == BackupStatus.completed
+    assert old_file.exists()
+    record = next(
+        record
+        for record in caplog.records
+        if record.name == "app.services.backup_importer"
+    )
+    assert record.getMessage() == "Post-restore old-file cleanup failed"
+    assert record.__dict__["cleanup_error_type"] == "PermissionError"
+    assert "sensitive injected unlink detail" not in caplog.text
+
+
+def test_restore_fsyncs_journal_and_final_file_before_database_commit(
+    session: Session,
+    restore_workspace: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user: User = restore_workspace["user"]
+    assert user.id is not None
+    operation = _pending_restore_operation(session, user.id)
+    events: list[str] = []
+    original_fsync = os.fsync
+
+    def track_fsync(descriptor: int) -> None:
+        mode = os.fstat(descriptor).st_mode
+        events.append("directory-fsync" if stat.S_ISDIR(mode) else "file-fsync")
+        original_fsync(descriptor)
+
+    def track_commit(database_session: Session) -> None:
+        events.append("commit")
+
+    monkeypatch.setattr("app.services.backup_importer.os.fsync", track_fsync)
+    event.listen(session, "before_commit", track_commit, once=True)
+
+    _importer(session, restore_workspace).restore(
+        restore_workspace["archive"],
+        user,
+        expected_workspace_owner_id=restore_workspace["archive_owner_id"],
+        operation=operation,
+        completed_at=datetime(2026, 7, 24, 14, 0, tzinfo=UTC),
+    )
+
+    commit_index = events.index("commit")
+    before_commit = events[:commit_index]
+    assert before_commit.count("file-fsync") >= 3
+    assert before_commit.count("directory-fsync") >= 2
+
+
+def test_final_directory_fsync_failure_rolls_back_and_removes_new_file(
+    session: Session,
+    restore_workspace: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user: User = restore_workspace["user"]
+    assert user.id is not None
+    before = _snapshot_workspace(session, user.id)
+    operation = _pending_restore_operation(session, user.id)
+    original_fsync = os.fsync
+    directory_syncs = 0
+
+    def fail_second_directory_fsync(descriptor: int) -> None:
+        nonlocal directory_syncs
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            directory_syncs += 1
+            if directory_syncs == 2:
+                raise OSError(errno.EIO, "injected directory fsync failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(
+        "app.services.backup_importer.os.fsync",
+        fail_second_directory_fsync,
+    )
+
+    with pytest.raises(BackupRestoreFailed):
+        _importer(session, restore_workspace).restore(
+            restore_workspace["archive"],
+            user,
+            expected_workspace_owner_id=restore_workspace["archive_owner_id"],
+            operation=operation,
+            completed_at=datetime(2026, 7, 24, 14, 0, tzinfo=UTC),
+        )
+
+    session.refresh(operation)
+    assert directory_syncs == 2
+    assert operation.status == BackupStatus.pending
+    assert _snapshot_workspace(session, user.id) == before
+    assert sorted(path.name for path in restore_workspace["upload_root"].iterdir()) == [
+        "old.txt",
+        "other.txt",
+    ]
+    assert not list(restore_workspace["temp_root"].glob("restore-*"))
+
+
+def test_unsupported_directory_fsync_does_not_fail_restore(
+    session: Session,
+    restore_workspace: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user: User = restore_workspace["user"]
+    assert user.id is not None
+    operation = _pending_restore_operation(session, user.id)
+    original_fsync = os.fsync
+    rejected_directory_syncs = 0
+
+    def reject_directory_fsync(descriptor: int) -> None:
+        nonlocal rejected_directory_syncs
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            rejected_directory_syncs += 1
+            raise OSError(errno.EINVAL, "directory fsync unsupported")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(
+        "app.services.backup_importer.os.fsync",
+        reject_directory_fsync,
+    )
+
+    result = _importer(session, restore_workspace).restore(
+        restore_workspace["archive"],
+        user,
+        expected_workspace_owner_id=restore_workspace["archive_owner_id"],
+        operation=operation,
+        completed_at=datetime(2026, 7, 24, 14, 0, tzinfo=UTC),
+    )
+
+    session.refresh(operation)
+    assert rejected_directory_syncs == 2
+    assert operation.status == BackupStatus.completed
+    assert len(result.reprocessing_document_ids) == 1
 
 
 def test_restore_failure_keeps_workspace_and_files_unchanged(
