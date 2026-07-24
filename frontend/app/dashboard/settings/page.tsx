@@ -7,6 +7,7 @@ import { useRouter } from "next/navigation";
 
 import { useAuth } from "@/lib/hooks/useAuth";
 import { AIModelSettings } from "@/components/features/settings/AIModelSettings";
+import { GoogleDriveBackupSettings } from "@/components/features/settings/GoogleDriveBackupSettings";
 import { Badge, Button, Card, CardContent, CardHeader, CardTitle, Input, Label } from "@/components/ui";
 import { changeEmail } from "@/lib/api/auth";
 import { useAuthStore } from "@/store/authStore";
@@ -138,6 +139,8 @@ export default function SettingsPage() {
       </div>
 
       <AIModelSettings />
+
+      <GoogleDriveBackupSettings />
 
       <div className="grid gap-4 lg:grid-cols-2">
         <Card className="border-border bg-card">
