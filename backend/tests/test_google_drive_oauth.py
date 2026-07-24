@@ -5,7 +5,7 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 from pydantic import ValidationError
 from sqlmodel import Session, select
 
@@ -72,6 +72,11 @@ def _create_user(session: Session, email: str = "drive@example.com") -> Persiste
 
 def _oauth_service(session: Session, client: Any, settings: Settings) -> GoogleDriveOAuthService:
     return GoogleDriveOAuthService(session=session, client=client, settings=settings)
+
+
+def _encrypt_with_settings(value: str, settings: Settings) -> bytes:
+    assert settings.GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY is not None
+    return Fernet(settings.GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY.encode()).encrypt(value.encode())
 
 
 def _google_response(request: httpx.Request) -> httpx.Response:
@@ -204,14 +209,20 @@ async def test_complete_authorization_exchanges_code_and_upserts_connection(sess
     assert connection.status == DriveConnectionStatus.connected
     assert connection.token_expires_at is not None
     assert b"refresh-secret" not in connection.encrypted_refresh_token
-    assert decrypt_provider_token(connection.encrypted_refresh_token) == "refresh-secret"
+    assert (
+        decrypt_provider_token(
+            connection.encrypted_refresh_token,
+            encryption_key=settings.GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY,
+        )
+        == "refresh-secret"
+    )
 
 
 @pytest.mark.asyncio
 async def test_complete_authorization_preserves_existing_refresh_token(session: Session) -> None:
     user = _create_user(session)
     settings = _settings()
-    encrypted_refresh_token = encrypt_provider_token("existing-refresh-secret")
+    encrypted_refresh_token = _encrypt_with_settings("existing-refresh-secret", settings)
     existing = GoogleDriveConnection(
         user_id=user.id,
         encrypted_refresh_token=encrypted_refresh_token,
@@ -238,7 +249,121 @@ async def test_complete_authorization_preserves_existing_refresh_token(session: 
         connection = await service.complete_authorization(user_id=user.id, state=state, code="code-secret")
 
     assert connection.id == existing.id
-    assert decrypt_provider_token(connection.encrypted_refresh_token) == "existing-refresh-secret"
+    assert (
+        decrypt_provider_token(
+            connection.encrypted_refresh_token,
+            encryption_key=settings.GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY,
+        )
+        == "existing-refresh-secret"
+    )
+
+
+@pytest.mark.asyncio
+async def test_complete_authorization_rejects_empty_disconnected_connection_without_refresh_token(
+    session: Session,
+) -> None:
+    user = _create_user(session)
+    settings = _settings()
+    existing = GoogleDriveConnection(
+        user_id=user.id,
+        encrypted_refresh_token=b"",
+        google_subject="old-subject",
+        google_email="old@example.com",
+        granted_scopes=[REQUIRED_SCOPE],
+        status=DriveConnectionStatus.disconnected,
+    )
+    session.add(existing)
+    session.commit()
+
+    def response_without_refresh_token(request: httpx.Request) -> httpx.Response:
+        response = _google_response(request)
+        if request.url == GoogleDriveOAuthService.TOKEN_URL:
+            payload = response.json()
+            payload.pop("refresh_token")
+            return httpx.Response(200, json=payload)
+        return response
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(response_without_refresh_token)
+    ) as client:
+        service = _oauth_service(session, client, settings)
+        state = service.create_state(user_id=user.id)
+
+        with pytest.raises(GoogleDriveOAuthError, match="did not return a refresh token"):
+            await service.complete_authorization(user_id=user.id, state=state, code="code-secret")
+
+    session.refresh(existing)
+    assert existing.status == DriveConnectionStatus.disconnected
+    assert existing.encrypted_refresh_token == b""
+
+
+@pytest.mark.asyncio
+async def test_complete_authorization_encrypts_with_service_token_encryption_key(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = _create_user(session)
+    settings = _settings()
+    monkeypatch.setattr(
+        "app.core.security.settings",
+        SimpleNamespace(
+            GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY=None,
+            SECRET_KEY=Fernet.generate_key().decode(),
+        ),
+    )
+    ciphertext: bytes | None = None
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_google_response)) as client:
+        service = _oauth_service(session, client, settings)
+        state = service.create_state(user_id=user.id)
+        try:
+            connection = await service.complete_authorization(
+                user_id=user.id, state=state, code="code-secret"
+            )
+        except ProviderTokenEncryptionError:
+            pass
+        else:
+            ciphertext = connection.encrypted_refresh_token
+
+    plaintext: bytes | None = None
+    if ciphertext is not None:
+        assert settings.GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY is not None
+        try:
+            plaintext = Fernet(settings.GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY.encode()).decrypt(ciphertext)
+        except InvalidToken:
+            pass
+    assert plaintext == b"refresh-secret"
+
+
+@pytest.mark.asyncio
+async def test_refresh_access_token_decrypts_with_service_token_encryption_key(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = _create_user(session)
+    settings = _settings()
+    connection = GoogleDriveConnection(
+        user_id=user.id,
+        encrypted_refresh_token=_encrypt_with_settings("refresh-secret", settings),
+        google_subject="google-subject",
+        google_email=user.email,
+        granted_scopes=[REQUIRED_SCOPE],
+    )
+    session.add(connection)
+    session.commit()
+    monkeypatch.setattr(
+        "app.core.security.settings",
+        SimpleNamespace(
+            GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY=None,
+            SECRET_KEY=Fernet.generate_key().decode(),
+        ),
+    )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_google_response)) as client:
+        try:
+            access_token = await _oauth_service(session, client, settings).refresh_access_token(connection)
+        except ProviderTokenEncryptionError:
+            access_token = None
+
+    assert access_token == "access-secret"
 
 
 @pytest.mark.asyncio
@@ -275,7 +400,7 @@ async def test_refresh_access_token_uses_google_token_endpoint(session: Session)
     settings = _settings()
     connection = GoogleDriveConnection(
         user_id=user.id,
-        encrypted_refresh_token=encrypt_provider_token("refresh-secret"),
+        encrypted_refresh_token=_encrypt_with_settings("refresh-secret", settings),
         google_subject="google-subject",
         google_email=user.email,
         granted_scopes=[REQUIRED_SCOPE],
@@ -301,7 +426,7 @@ async def test_disconnect_attempts_revocation_and_disables_local_connection(sess
     settings = _settings()
     connection = GoogleDriveConnection(
         user_id=user.id,
-        encrypted_refresh_token=encrypt_provider_token("refresh-secret"),
+        encrypted_refresh_token=_encrypt_with_settings("refresh-secret", settings),
         google_subject="google-subject",
         google_email=user.email,
         granted_scopes=[REQUIRED_SCOPE],
@@ -324,7 +449,7 @@ async def test_disconnect_disables_local_connection_when_revocation_fails(sessio
     settings = _settings()
     connection = GoogleDriveConnection(
         user_id=user.id,
-        encrypted_refresh_token=encrypt_provider_token("refresh-secret"),
+        encrypted_refresh_token=_encrypt_with_settings("refresh-secret", settings),
         google_subject="google-subject",
         google_email=user.email,
         granted_scopes=[REQUIRED_SCOPE],

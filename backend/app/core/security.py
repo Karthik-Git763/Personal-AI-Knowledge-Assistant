@@ -25,8 +25,8 @@ class ProviderTokenEncryptionError(RuntimeError):
     """Raised when Google Drive token encryption cannot be safely performed."""
 
 
-def _provider_token_fernet() -> Fernet:
-    key = settings.GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY
+def _provider_token_fernet(encryption_key: str | None = None) -> Fernet:
+    key = encryption_key or settings.GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY
     if not key:
         raise ProviderTokenEncryptionError("Google Drive token encryption is not configured")
     try:
@@ -35,15 +35,15 @@ def _provider_token_fernet() -> Fernet:
         raise ProviderTokenEncryptionError("Google Drive token encryption configuration is invalid") from error
 
 
-def encrypt_provider_token(value: str) -> bytes:
+def encrypt_provider_token(value: str, *, encryption_key: str | None = None) -> bytes:
     """Encrypt a provider credential with the dedicated Google Drive key."""
-    return _provider_token_fernet().encrypt(value.encode())
+    return _provider_token_fernet(encryption_key).encrypt(value.encode())
 
 
-def decrypt_provider_token(value: bytes) -> str:
+def decrypt_provider_token(value: bytes, *, encryption_key: str | None = None) -> str:
     """Decrypt a provider credential without exposing ciphertext failures."""
     try:
-        return _provider_token_fernet().decrypt(value).decode()
+        return _provider_token_fernet(encryption_key).decrypt(value).decode()
     except (InvalidToken, UnicodeDecodeError) as error:
         raise ProviderTokenEncryptionError("Google Drive provider token cannot be decrypted") from error
 

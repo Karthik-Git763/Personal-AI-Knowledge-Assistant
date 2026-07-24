@@ -130,8 +130,14 @@ class GoogleDriveOAuthService:
         ).first()
         refresh_token = token_payload.get("refresh_token")
         if isinstance(refresh_token, str) and refresh_token:
-            encrypted_refresh_token = encrypt_provider_token(refresh_token)
-        elif connection is not None:
+            encrypted_refresh_token = encrypt_provider_token(
+                refresh_token, encryption_key=self.settings.GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY
+            )
+        elif (
+            connection is not None
+            and connection.status == DriveConnectionStatus.connected
+            and connection.encrypted_refresh_token
+        ):
             encrypted_refresh_token = connection.encrypted_refresh_token
         else:
             raise GoogleDriveOAuthError("Google Drive authorization did not return a refresh token")
@@ -163,7 +169,10 @@ class GoogleDriveOAuthService:
         self._require_oauth_configuration()
         if connection.status != DriveConnectionStatus.connected or not connection.encrypted_refresh_token:
             raise GoogleDriveOAuthError("Google Drive connection is not active")
-        refresh_token = decrypt_provider_token(connection.encrypted_refresh_token)
+        refresh_token = decrypt_provider_token(
+            connection.encrypted_refresh_token,
+            encryption_key=self.settings.GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY,
+        )
         token_payload = await self._post_json(
             self.TOKEN_URL,
             data={
@@ -184,7 +193,10 @@ class GoogleDriveOAuthService:
 
     async def disconnect(self, connection: GoogleDriveConnection) -> None:
         try:
-            refresh_token = decrypt_provider_token(connection.encrypted_refresh_token)
+            refresh_token = decrypt_provider_token(
+                connection.encrypted_refresh_token,
+                encryption_key=self.settings.GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY,
+            )
             await self._post(self.REVOCATION_URL, data={"token": refresh_token})
         except Exception:
             # Google revocation is best effort; credentials are still disabled locally below.
