@@ -22,9 +22,8 @@ from app.core.middleware import (
     RequestLoggingMiddleware,
     SecurityHeadersMiddleware,
 )
-
-# Rate Limiter
 from app.core.rate_limit import limiter
+from app.services.backup_scheduler import BackupScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +34,8 @@ async def lifespan(_: FastAPI):
     FastAPI lifespan context manager for startup and shutdown events.
     Handles database initialization with retry logic on startup.
     """
+    backup_scheduler = BackupScheduler()
+
     # Startup
     try:
         logger.info("Starting application...")
@@ -42,15 +43,18 @@ async def lifespan(_: FastAPI):
         if not await test_db_connection():
             raise ConnectionError("Database connection test failed")
 
+        await backup_scheduler.start()
+
         logger.info("✓ Application startup complete")
     except Exception as e:
         logger.error(f"✗ Application startup failed: {e}")
         raise
 
-    yield
-
-    # Shutdown
-    logger.info("Shutting down application...")
+    try:
+        yield
+    finally:
+        await backup_scheduler.stop()
+        logger.info("Shutting down application...")
 
 
 # FastAPI app
