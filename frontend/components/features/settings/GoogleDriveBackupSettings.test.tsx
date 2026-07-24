@@ -35,6 +35,7 @@ const snapshot: WorkspaceBackup = {
   completed_at: "2026-07-25T08:01:00Z",
   failure_message: null,
   restore_eligible: true,
+  app_version: "0.2.0",
 };
 
 const actions = {
@@ -71,7 +72,9 @@ describe("GoogleDriveBackupSettingsView", () => {
     expect(markup).toContain("4 notes");
     expect(markup).toContain("2 documents");
     expect(markup).toContain("Schema 1");
+    expect(markup).toContain("App 0.2.0");
     expect(markup).toContain("Restore");
+    expect(markup).toContain("private workspace snapshots");
   });
 
   it("offers reconnection when authorization needs attention", () => {
@@ -98,6 +101,11 @@ describe("GoogleDriveBackupSettingsView", () => {
 
     expect(markup).toContain("Uploading backup");
     expect(markup).toMatch(/<button[^>]*disabled[^>]*>[\s\S]*?Back up now[\s\S]*?<\/button>/);
+    const refreshButton = markup.match(
+      /<button[^>]*aria-label="Refresh backup status"[^>]*>[\s\S]*?Refresh<\/button>/
+    )?.[0];
+    expect(refreshButton).toBeDefined();
+    expect(refreshButton).not.toContain('disabled=""');
   });
 });
 
@@ -134,5 +142,23 @@ describe("restore confirmation", () => {
     expect(shouldPollBackupOperation("uploading")).toBe(true);
     expect(shouldPollBackupOperation("completed")).toBe(false);
     expect(shouldPollBackupOperation("failed")).toBe(false);
+  });
+
+  it("announces restore preview and submit errors", () => {
+    const markup = renderToStaticMarkup(
+      <RestoreConfirmationContent
+        backup={snapshot}
+        confirmation="RESTORE"
+        isSubmitting={false}
+        onCancel={vi.fn()}
+        onConfirmationChange={vi.fn()}
+        onConfirm={vi.fn()}
+        error="Restore preview failed."
+      />
+    );
+
+    expect(markup).toContain('role="alert"');
+    expect(markup).toContain('aria-live="assertive"');
+    expect(markup).toContain("Restore preview failed.");
   });
 });

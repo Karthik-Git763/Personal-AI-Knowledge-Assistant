@@ -14,7 +14,7 @@ import {
   Trash2,
   Unplug,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   Badge,
@@ -44,6 +44,10 @@ import {
   type GoogleDriveBackupStatus,
   type WorkspaceBackup,
 } from "@/lib/api/backups";
+import {
+  loadBackupSettingsData,
+  pollBackupOperation,
+} from "@/lib/api/backupLifecycle";
 import { APIRequestError } from "@/lib/api/client";
 
 import { RestoreBackupDialog } from "./RestoreBackupDialog";
@@ -179,7 +183,7 @@ export function GoogleDriveBackupSettingsView({
           <div className="space-y-1">
             <CardTitle>Google Drive backup</CardTitle>
             <p className="text-xs text-muted-foreground">
-              Keep five encrypted workspace snapshots in Drive app data.
+              Keep five private workspace snapshots in Drive app data.
             </p>
           </div>
           <Badge variant={statusVariant}>{statusLabel}</Badge>
@@ -319,6 +323,11 @@ export function GoogleDriveBackupSettingsView({
                             <span className="text-xs text-muted-foreground">
                               Schema {backup.schema_version}
                             </span>
+                            {backup.app_version ? (
+                              <span className="text-xs text-muted-foreground">
+                                App {backup.app_version}
+                              </span>
+                            ) : null}
                             <span className="text-xs text-muted-foreground">
                               {formatBytes(backup.archive_size_bytes)}
                             </span>
@@ -370,7 +379,13 @@ export function GoogleDriveBackupSettingsView({
         ) : null}
 
         <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border pt-4">
-          <Button type="button" variant="outline" onClick={onRefresh} disabled={locked}>
+          <Button
+            type="button"
+            variant="outline"
+            aria-label="Refresh backup status"
+            onClick={onRefresh}
+            disabled={actionPending}
+          >
             <RefreshCw className="h-4 w-4" />
             Refresh
           </Button>
@@ -450,29 +465,46 @@ export function GoogleDriveBackupSettings() {
   const [isActionPending, setIsActionPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const statusRef = useRef<GoogleDriveBackupStatus | null>(null);
+  const backupsRef = useRef<WorkspaceBackup[]>([]);
+
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
+
+  useEffect(() => {
+    backupsRef.current = backups;
+  }, [backups]);
 
   const loadBackupData = useCallback(async () => {
     setError(null);
-    try {
-      const nextStatus = await getGoogleDriveBackupStatus();
-      setStatus(nextStatus);
-      if (nextStatus.connection_status === "connected") {
-        setBackups(await listWorkspaceBackups());
-      } else {
-        setBackups([]);
-      }
-    } catch (loadError) {
-      setStatus({
+    const result = await loadBackupSettingsData({
+      getStatus: getGoogleDriveBackupStatus,
+      listBackups: listWorkspaceBackups,
+      previousStatus: statusRef.current,
+      previousBackups: backupsRef.current,
+    });
+
+    if (result.statusError) {
+      const fallbackStatus = {
         ...EMPTY_BACKUP_STATUS,
         configured:
-          !(loadError instanceof APIRequestError) ||
-          loadError.errorCode !== "GOOGLE_DRIVE_NOT_CONFIGURED",
-      });
-      setBackups([]);
-      setError(safeBackupError(loadError));
-    } finally {
+          !(result.statusError instanceof APIRequestError) ||
+          result.statusError.errorCode !== "GOOGLE_DRIVE_NOT_CONFIGURED",
+      };
+      setStatus(result.status ?? fallbackStatus);
+      setBackups(result.backups);
+      setError(safeBackupError(result.statusError));
       setIsLoading(false);
+      return;
     }
+
+    setStatus(result.status);
+    setBackups(result.backups);
+    if (result.listError) {
+      setError("Backup status loaded, but restore points could not be refreshed.");
+    }
+    setIsLoading(false);
   }, []);
 
   useEffect(() => {
@@ -510,20 +542,18 @@ export function GoogleDriveBackupSettings() {
 
   useEffect(() => {
     if (!pollingOperationId) return;
-    let cancelled = false;
-    let pollTimer: number | undefined;
-
-    const poll = async () => {
-      try {
-        const operation = await getBackupOperation(pollingOperationId);
-        if (cancelled) return;
-        if (shouldPollBackupOperation(operation.status)) {
-          setStatus((current) =>
-            current ? { ...current, active_operation: operation } : current
-          );
-          pollTimer = window.setTimeout(() => void poll(), 1500);
-          return;
-        }
+    const controller = new AbortController();
+    void pollBackupOperation({
+      operationId: pollingOperationId,
+      getOperation: getBackupOperation,
+      signal: controller.signal,
+      onProgress: (operation) => {
+        setError(null);
+        setStatus((current) =>
+          current ? { ...current, active_operation: operation } : current
+        );
+      },
+      onTerminal: (operation) => {
         setMessage(
           operation.status === "completed"
             ? operation.operation_kind === "restore"
@@ -531,17 +561,18 @@ export function GoogleDriveBackupSettings() {
               : "Workspace backup completed."
             : operation.failure_message ?? "The backup operation failed."
         );
-        await loadBackupData();
-      } catch (pollError) {
-        if (!cancelled) setError(safeBackupError(pollError));
-      }
-    };
-
-    pollTimer = window.setTimeout(() => void poll(), 1500);
+        void loadBackupData();
+      },
+      onTransientError: () => {
+        setError("Operation status is temporarily unavailable. Retrying automatically.");
+      },
+      onFatalError: (pollError) => {
+        setError(safeBackupError(pollError));
+      },
+    });
 
     return () => {
-      cancelled = true;
-      if (pollTimer !== undefined) window.clearTimeout(pollTimer);
+      controller.abort();
     };
   }, [loadBackupData, pollingOperationId]);
 

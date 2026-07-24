@@ -16,6 +16,7 @@ export interface WorkspaceBackup {
   status: BackupStatus;
   trigger: BackupTrigger;
   schema_version: number;
+  app_version?: string | null;
   archive_size_bytes: number | null;
   item_counts: Record<string, number>;
   started_at: string | null;
@@ -27,7 +28,9 @@ export interface WorkspaceBackup {
 export interface RestorePointSummary {
   backup_id: string;
   schema_version: number;
+  app_version?: string | null;
   archive_size_bytes: number;
+  item_counts?: Record<string, number>;
   created_at: string;
   restore_eligible: boolean;
 }
@@ -48,6 +51,7 @@ export interface GoogleDriveBackupStatus {
 export interface RestorePreview {
   backup_id: string;
   schema_version: number;
+  app_version?: string | null;
   item_counts: Record<string, number>;
   archive_size_bytes: number | null;
 }

@@ -126,7 +126,11 @@ export function RestoreConfirmationContent({
       </div>
 
       {error ? (
-        <p className="border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+        <p
+          className="border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive"
+          role="alert"
+          aria-live="assertive"
+        >
           {error}
         </p>
       ) : null}
