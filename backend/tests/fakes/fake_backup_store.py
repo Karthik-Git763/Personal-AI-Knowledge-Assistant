@@ -10,7 +10,7 @@ from app.services.backup_store import BackupObjectMetadata, StoredBackup
 
 @dataclass
 class FakeBackupStore:
-    owner_id: UUID
+    drive_owner_id: UUID
     backups: list[StoredBackup] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
     fail_deletes: set[str] = field(default_factory=set)
@@ -20,18 +20,18 @@ class FakeBackupStore:
 
     @classmethod
     def with_backups(cls, successful: int, incomplete: int, foreign: int = 0) -> FakeBackupStore:
-        owner_id = uuid4()
+        drive_owner_id = uuid4()
         now = datetime.now(UTC)
         backups = [
-            _backup(owner_id, index, now - timedelta(minutes=index), completed=True)
+            _backup(drive_owner_id, index, now - timedelta(minutes=index), completed=True)
             for index in range(successful)
         ]
-        store = cls(owner_id=owner_id, backups=backups)
+        store = cls(drive_owner_id=drive_owner_id, backups=backups)
         if backups:
             store.oldest_successful = backups[-1]
         if incomplete:
             store.incomplete = _backup(
-                owner_id, successful + 1, now - timedelta(minutes=successful + 1), completed=False
+                drive_owner_id, successful + 1, now - timedelta(minutes=successful + 1), completed=False
             )
             store.backups.append(store.incomplete)
         if foreign:
@@ -53,7 +53,7 @@ class FakeBackupStore:
         self.backups.append(backup)
         return backup
 
-    async def list(self, owner_id: UUID) -> list[StoredBackup]:
+    async def list(self, drive_owner_id: UUID) -> list[StoredBackup]:
         return list(self.backups)
 
     async def download(self, remote_id: str, destination: Path) -> Path:
@@ -66,9 +66,10 @@ class FakeBackupStore:
         self.deleted.append(remote_id)
 
 
-def _backup(owner_id: UUID, index: int, created_at: datetime, *, completed: bool) -> StoredBackup:
+def _backup(drive_owner_id: UUID, index: int, created_at: datetime, *, completed: bool) -> StoredBackup:
     metadata = BackupObjectMetadata(
-        owner_id=owner_id,
+        drive_owner_id=drive_owner_id,
+        workspace_owner_id=uuid4(),
         backup_id=uuid4(),
         schema_version=1,
         archive_checksum=f"{index:064x}",

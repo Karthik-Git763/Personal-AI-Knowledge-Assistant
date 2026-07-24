@@ -75,3 +75,33 @@ Self-review:
 
 Concerns:
 - No remaining known concerns in this remediation scope.
+
+## Cross-Platform Drive Identity Remediation
+
+Status: complete
+
+Files:
+- `backend/app/services/backup_store.py`
+- `backend/app/services/google_drive_store.py`
+- `backend/app/services/backup_coordinator.py`
+- `backend/app/services/google_drive_oauth.py`
+- `backend/tests/fakes/fake_backup_store.py`
+- `backend/tests/test_google_drive_store.py`
+- `backend/tests/test_backup_retention.py`
+- `backend/tests/test_google_drive_oauth.py`
+- `backend/tests/test_backup_coordinator.py`
+- `.superpowers/sdd/task-5-report.md`
+
+RED/GREEN evidence:
+- RED: the focused cross-install tests initially failed during collection because `derive_drive_owner_id` did not exist.
+- GREEN: `docker compose exec backend pytest -q tests/test_google_drive_store.py tests/test_backup_retention.py tests/test_google_drive_oauth.py tests/test_backup_coordinator.py tests/test_backup_scheduler.py` completed with `68 passed in 113.43s`.
+- Static checks: focused Ruff completed with `All checks passed!`; BasedPyright completed with `0 errors, 0 warnings, 0 notes`.
+
+Self-review:
+- Confirmed `drive_owner_id` is a UUIDv5 derived from `GoogleDriveConnection.google_subject` and a fixed Cognolith namespace; remote app properties never include the raw Google subject.
+- Confirmed remote metadata stores and parses `drive_owner_id` for remote authorization/list/retention and `workspace_owner_id` for archive-manifest integrity; the archive manifest owner remains the current workspace user's `portable_id`.
+- Confirmed a second installation with a different workspace owner UUID but the same Google subject lists and authorizes a prior snapshot; a different Google subject queries a different remote owner UUID and receives no prior snapshots.
+- Confirmed no migration files were added or modified.
+
+Concerns:
+- No remaining known concerns in this remediation scope.

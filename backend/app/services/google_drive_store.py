@@ -26,6 +26,7 @@ from app.services.google_drive_oauth import (
     GoogleDriveOAuthReauthorizationRequiredError,
     GoogleDriveOAuthRetryableError,
     GoogleDriveOAuthService,
+    derive_drive_owner_id,
 )
 
 
@@ -59,15 +60,14 @@ class GoogleDriveStore:
 
     def __init__(
         self,
-        owner_id: UUID,
         connection: GoogleDriveConnection,
         oauth_service: GoogleDriveOAuthService,
         client: httpx.AsyncClient | None = None,
         settings: Settings = default_settings,
         session: Session | None = None,
     ) -> None:
-        self.owner_id = owner_id
         self.connection = connection
+        self.drive_owner_id = derive_drive_owner_id(connection.google_subject)
         self.oauth_service = oauth_service
         self.client = client or httpx.AsyncClient(timeout=30.0)
         self.settings = settings
@@ -79,8 +79,8 @@ class GoogleDriveStore:
 
     async def upload(self, archive: Path, metadata: BackupObjectMetadata) -> StoredBackup:
         self._validate_metadata(metadata)
-        if metadata.owner_id != self.owner_id:
-            raise ValueError("Backup metadata belongs to another owner")
+        if metadata.drive_owner_id != self.drive_owner_id:
+            raise ValueError("Backup metadata belongs to another Drive identity")
         if not archive.is_file():
             raise ValueError("Backup archive must be a regular file")
         size = archive.stat().st_size
@@ -134,10 +134,10 @@ class GoogleDriveStore:
         self._trusted_remote_ids.add(completed.remote_id)
         return completed
 
-    async def list(self, owner_id: UUID) -> list[StoredBackup]:
-        if owner_id != self.owner_id:
-            raise ValueError("Google Drive store is bound to a different owner")
-        query = self._list_query(owner_id)
+    async def list(self, drive_owner_id: UUID) -> list[StoredBackup]:
+        if drive_owner_id != self.drive_owner_id:
+            raise ValueError("Google Drive store is bound to a different Drive identity")
+        query = self._list_query(drive_owner_id)
         files: list[StoredBackup] = []
         page_token: str | None = None
         while True:
@@ -156,8 +156,8 @@ class GoogleDriveStore:
                 raise GoogleDriveMalformedPayloadError("Google Drive response is missing files")
             for raw_file in raw_files:
                 backup = self._parse_backup(raw_file)
-                if backup.metadata.owner_id != owner_id:
-                    raise GoogleDriveMalformedPayloadError("Google Drive returned another owner's backup")
+                if backup.metadata.drive_owner_id != drive_owner_id:
+                    raise GoogleDriveMalformedPayloadError("Google Drive returned another Drive owner's backup")
                 files.append(backup)
                 self._trusted_remote_ids.add(backup.remote_id)
             raw_page_token = payload.get("nextPageToken")
@@ -211,7 +211,7 @@ class GoogleDriveStore:
     def authorize_backup(self, backup: StoredBackup | WorkspaceBackup) -> None:
         """Allow an ID from a validated stored backup or completed local backup record."""
         if isinstance(backup, StoredBackup):
-            if not is_valid_stored_backup(backup, self.owner_id):
+            if not is_valid_stored_backup(backup, self.drive_owner_id):
                 raise ValueError("Stored backup is not valid for this owner")
             remote_id = backup.remote_id
         elif isinstance(backup, WorkspaceBackup):
@@ -326,7 +326,8 @@ class GoogleDriveStore:
         if self._required_string(properties, "cognolith") != "backup":
             raise GoogleDriveMalformedPayloadError("Google Drive file is not a Cognolith backup")
         try:
-            owner_id = UUID(self._required_string(properties, "owner_id"))
+            drive_owner_id = UUID(self._required_string(properties, "drive_owner_id"))
+            workspace_owner_id = UUID(self._required_string(properties, "workspace_owner_id"))
             backup_id = UUID(self._required_string(properties, "backup_id"))
         except ValueError as error:
             raise GoogleDriveMalformedPayloadError("Google Drive backup identifiers are invalid") from error
@@ -337,7 +338,8 @@ class GoogleDriveStore:
         if not self._CHECKSUM.fullmatch(checksum):
             raise GoogleDriveMalformedPayloadError("Google Drive backup checksum is invalid")
         return BackupObjectMetadata(
-            owner_id=owner_id,
+            drive_owner_id=drive_owner_id,
+            workspace_owner_id=workspace_owner_id,
             backup_id=backup_id,
             schema_version=int(raw_schema_version),
             archive_checksum=checksum,
@@ -347,7 +349,8 @@ class GoogleDriveStore:
     def _app_properties(self, metadata: BackupObjectMetadata, *, completed: bool) -> dict[str, str]:
         return {
             "cognolith": "backup",
-            "owner_id": str(metadata.owner_id),
+            "drive_owner_id": str(metadata.drive_owner_id),
+            "workspace_owner_id": str(metadata.workspace_owner_id),
             "backup_id": str(metadata.backup_id),
             "schema_version": str(metadata.schema_version),
             "archive_checksum": metadata.archive_checksum,
@@ -356,10 +359,11 @@ class GoogleDriveStore:
         }
 
     @classmethod
-    def _list_query(cls, owner_id: UUID) -> str:
+    def _list_query(cls, drive_owner_id: UUID) -> str:
         return (
             f"appProperties has {{ key='cognolith' and value='{cls._escape_query_value('backup')}' }} "
-            f"and appProperties has {{ key='owner_id' and value='{cls._escape_query_value(str(owner_id))}' }} "
+            "and appProperties has { key='drive_owner_id' "
+            f"and value='{cls._escape_query_value(str(drive_owner_id))}' }} "
             "and trashed = false"
         )
 

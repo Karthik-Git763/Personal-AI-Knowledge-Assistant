@@ -14,7 +14,7 @@ from app.core.security import encrypt_provider_token
 from app.models.backup import BackupStatus, GoogleDriveConnection, WorkspaceBackup
 from app.models.user import User
 from app.services.backup_store import BackupObjectMetadata, StoredBackup
-from app.services.google_drive_oauth import GoogleDriveOAuthService
+from app.services.google_drive_oauth import GoogleDriveOAuthService, derive_drive_owner_id
 from app.services.google_drive_store import (
     GoogleDriveMalformedPayloadError,
     GoogleDriveReauthorizationRequiredError,
@@ -50,8 +50,14 @@ def configured_token_encryption(monkeypatch: pytest.MonkeyPatch) -> Settings:
     return configured_settings
 
 
-def _connection(session: Session, settings: Settings) -> tuple[UUID, GoogleDriveConnection]:
-    user = User(email="drive-store@example.com", hashed_password="hashed-password")
+def _connection(
+    session: Session,
+    settings: Settings,
+    *,
+    email: str = "drive-store@example.com",
+    google_subject: str = "google-subject",
+) -> tuple[UUID, GoogleDriveConnection]:
+    user = User(email=email, hashed_password="hashed-password")
     session.add(user)
     session.commit()
     session.refresh(user)
@@ -61,7 +67,7 @@ def _connection(session: Session, settings: Settings) -> tuple[UUID, GoogleDrive
         encrypted_refresh_token=encrypt_provider_token(
             "refresh-secret", encryption_key=settings.GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY
         ),
-        google_subject="google-subject",
+        google_subject=google_subject,
         google_email=user.email,
         granted_scopes=[GoogleDriveOAuthService.REQUIRED_SCOPE],
     )
@@ -70,9 +76,12 @@ def _connection(session: Session, settings: Settings) -> tuple[UUID, GoogleDrive
     return user.portable_id, connection
 
 
-def _metadata(owner_id: UUID) -> BackupObjectMetadata:
+def _metadata(
+    drive_owner_id: UUID, workspace_owner_id: UUID | None = None
+) -> BackupObjectMetadata:
     return BackupObjectMetadata(
-        owner_id=owner_id,
+        drive_owner_id=drive_owner_id,
+        workspace_owner_id=workspace_owner_id or uuid4(),
         backup_id=uuid4(),
         schema_version=1,
         archive_checksum=CHECKSUM,
@@ -96,7 +105,8 @@ def _drive_file(
         "parents": parents if parents is not None else ["appDataFolder"],
         "appProperties": {
             "cognolith": "backup",
-            "owner_id": str(metadata.owner_id),
+            "drive_owner_id": str(metadata.drive_owner_id),
+            "workspace_owner_id": str(metadata.workspace_owner_id),
             "backup_id": str(metadata.backup_id),
             "schema_version": str(metadata.schema_version),
             "archive_checksum": metadata.archive_checksum,
@@ -124,22 +134,19 @@ async def _store(
     *,
     with_session: bool = False,
 ) -> tuple[GoogleDriveStore, UUID]:
-    owner_id, connection = _connection(session, settings)
+    _, connection = _connection(session, settings)
     transport = handler if isinstance(handler, httpx.MockTransport) else httpx.MockTransport(handler)
     client = httpx.AsyncClient(transport=transport)
     oauth_service = GoogleDriveOAuthService(session=session, client=client, settings=settings)
     store_kwargs: dict[str, Session] = {"session": session} if with_session else {}
-    return (
-        GoogleDriveStore(
-            owner_id=owner_id,
-            connection=connection,
-            oauth_service=oauth_service,
-            client=client,
-            settings=settings,
-            **store_kwargs,
-        ),
-        owner_id,
+    store = GoogleDriveStore(
+        connection=connection,
+        oauth_service=oauth_service,
+        client=client,
+        settings=settings,
+        **store_kwargs,
     )
+    return store, store.drive_owner_id
 
 
 def _token_response(request: httpx.Request) -> httpx.Response:
@@ -163,8 +170,12 @@ async def test_upload_uses_resumable_appdata_and_marks_validated_file_complete(
             return _token_response(request)
         if request.method == "POST" and request.url.path.endswith("/upload/drive/v3/files"):
             body = json.loads(request.content)
+            assert metadata is not None
             assert body["parents"] == ["appDataFolder"]
             assert body["appProperties"]["completed"] == "false"
+            assert body["appProperties"]["drive_owner_id"] == str(metadata.drive_owner_id)
+            assert body["appProperties"]["workspace_owner_id"] == str(metadata.workspace_owner_id)
+            assert "google-subject" not in body["appProperties"].values()
             assert request.url.params["uploadType"] == "resumable"
             return httpx.Response(200, headers={"Location": "https://upload.example/session"})
         if request.method == "PUT" and request.url == "https://upload.example/session":
@@ -202,7 +213,8 @@ async def test_list_uses_escaped_exact_owner_query_and_rejects_malformed_payload
         query = request.url.params["q"]
         assert "trashed = false" in query
         assert "appProperties has" in query
-        assert "owner_id" in query
+        assert "drive_owner_id" in query
+        assert "workspace_owner_id" not in query
         return httpx.Response(200, json={"files": [{"id": REMOTE_ID}]})
 
     store, owner_id = await _store(session, configured_token_encryption, handler)
@@ -240,6 +252,99 @@ async def test_list_returns_only_valid_owner_backups_and_authorizes_remote_id_fo
 
     assert listed[0].metadata == metadata
     assert listed[0].created_at == metadata.created_at
+
+
+@pytest.mark.asyncio
+async def test_same_google_subject_on_second_installation_lists_and_authorizes_prior_snapshot(
+    session: Session, configured_token_encryption: Settings
+) -> None:
+    first_workspace_owner_id, _ = _connection(
+        session,
+        configured_token_encryption,
+        email="first-install@example.com",
+        google_subject="shared-google-subject",
+    )
+    second_workspace_owner_id, second_connection = _connection(
+        session,
+        configured_token_encryption,
+        email="second-install@example.com",
+        google_subject="shared-google-subject",
+    )
+    drive_owner_id = derive_drive_owner_id(second_connection.google_subject)
+    metadata = BackupObjectMetadata(
+        drive_owner_id=drive_owner_id,
+        workspace_owner_id=first_workspace_owner_id,
+        backup_id=uuid4(),
+        schema_version=1,
+        archive_checksum=CHECKSUM,
+        created_at=datetime(2026, 7, 24, 12, 0, tzinfo=UTC),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url == GoogleDriveOAuthService.TOKEN_URL:
+            return _token_response(request)
+        if request.method == "GET":
+            assert str(drive_owner_id) in request.url.params["q"]
+            return httpx.Response(200, json={"files": [_drive_file(metadata)]})
+        if request.method == "DELETE":
+            assert request.url.path.endswith(REMOTE_ID)
+            return httpx.Response(204)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    store = GoogleDriveStore(
+        connection=second_connection,
+        oauth_service=GoogleDriveOAuthService(
+            session=session, client=client, settings=configured_token_encryption
+        ),
+        client=client,
+        settings=configured_token_encryption,
+    )
+    try:
+        listed = await store.list(drive_owner_id)
+        store.authorize_backup(listed[0])
+        await store.delete(listed[0].remote_id)
+    finally:
+        await store.aclose()
+
+    assert first_workspace_owner_id != second_workspace_owner_id
+    assert listed[0].metadata.workspace_owner_id == first_workspace_owner_id
+
+
+@pytest.mark.asyncio
+async def test_different_google_subject_cannot_list_prior_snapshot(
+    session: Session, configured_token_encryption: Settings
+) -> None:
+    prior_drive_owner_id = derive_drive_owner_id("prior-google-subject")
+    _, connection = _connection(
+        session,
+        configured_token_encryption,
+        email="other-install@example.com",
+        google_subject="other-google-subject",
+    )
+    expected_drive_owner_id = derive_drive_owner_id(connection.google_subject)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url == GoogleDriveOAuthService.TOKEN_URL:
+            return _token_response(request)
+        assert request.method == "GET"
+        assert str(expected_drive_owner_id) in request.url.params["q"]
+        assert str(prior_drive_owner_id) not in request.url.params["q"]
+        return httpx.Response(200, json={"files": []})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    store = GoogleDriveStore(
+        connection=connection,
+        oauth_service=GoogleDriveOAuthService(
+            session=session, client=client, settings=configured_token_encryption
+        ),
+        client=client,
+        settings=configured_token_encryption,
+    )
+    try:
+        assert await store.list(expected_drive_owner_id) == []
+    finally:
+        await store.aclose()
 
 
 @pytest.mark.asyncio

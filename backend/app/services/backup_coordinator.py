@@ -32,7 +32,7 @@ from app.services.backup_store import (
     StoredBackup,
     prune_successful_backups,
 )
-from app.services.google_drive_oauth import GoogleDriveOAuthService
+from app.services.google_drive_oauth import GoogleDriveOAuthService, derive_drive_owner_id
 from app.services.google_drive_store import (
     GoogleDriveReauthorizationRequiredError,
     GoogleDriveStore,
@@ -154,8 +154,10 @@ class BackupCoordinator:
             os.chmod(export.path, 0o600)
             if export.manifest.owner_id != user.portable_id:
                 raise BackupVerificationError("Backup manifest owner does not match the workspace")
+            drive_owner_id = derive_drive_owner_id(connection.google_subject)
             metadata = BackupObjectMetadata(
-                owner_id=export.manifest.owner_id,
+                drive_owner_id=drive_owner_id,
+                workspace_owner_id=export.manifest.owner_id,
                 backup_id=export.manifest.backup_id,
                 schema_version=export.manifest.schema_version,
                 archive_checksum=export.archive_checksum,
@@ -183,7 +185,7 @@ class BackupCoordinator:
             session.add_all([backup, schedule])
             session.commit()
 
-            await self._run_retention_cleanup(session, backup, store, user.portable_id)
+            await self._run_retention_cleanup(session, backup, store, drive_owner_id)
             return self._detach(session, backup)
         except asyncio.CancelledError:
             was_completed = backup.status == BackupStatus.completed
@@ -204,10 +206,10 @@ class BackupCoordinator:
                     await closer()
 
     async def _run_retention_cleanup(
-        self, session: Session, backup: WorkspaceBackup, store: BackupStore, owner_id: UUID
+        self, session: Session, backup: WorkspaceBackup, store: BackupStore, drive_owner_id: UUID
     ) -> None:
         try:
-            await prune_successful_backups(store, owner_id=owner_id, keep=5)
+            await prune_successful_backups(store, drive_owner_id=drive_owner_id, keep=5)
         except asyncio.CancelledError:
             self._record_cleanup_warning(session, backup)
             raise
@@ -369,7 +371,6 @@ def _default_store_factory(
     session: Session, user: User, connection: GoogleDriveConnection
 ) -> GoogleDriveStore:
     return GoogleDriveStore(
-        owner_id=user.portable_id,
         connection=connection,
         oauth_service=GoogleDriveOAuthService(session=session),
         session=session,

@@ -10,7 +10,8 @@ from uuid import UUID
 
 @dataclass(frozen=True)
 class BackupObjectMetadata:
-    owner_id: UUID
+    drive_owner_id: UUID
+    workspace_owner_id: UUID
     backup_id: UUID
     schema_version: int
     archive_checksum: str
@@ -30,7 +31,7 @@ class StoredBackup:
 class BackupStore(Protocol):
     async def upload(self, archive: Path, metadata: BackupObjectMetadata) -> StoredBackup: ...
 
-    async def list(self, owner_id: UUID) -> list[StoredBackup]: ...
+    async def list(self, drive_owner_id: UUID) -> list[StoredBackup]: ...
 
     async def download(self, remote_id: str, destination: Path) -> Path: ...
 
@@ -48,11 +49,11 @@ class BackupCleanupError(RuntimeError):
 _CHECKSUM = re.compile(r"[0-9a-f]{64}")
 
 
-def is_valid_stored_backup(backup: StoredBackup, owner_id: UUID) -> bool:
+def is_valid_stored_backup(backup: StoredBackup, drive_owner_id: UUID) -> bool:
     metadata = backup.metadata
     return (
         backup.completed
-        and metadata.owner_id == owner_id
+        and metadata.drive_owner_id == drive_owner_id
         and bool(backup.remote_id)
         and bool(backup.name)
         and backup.size >= 0
@@ -64,14 +65,14 @@ def is_valid_stored_backup(backup: StoredBackup, owner_id: UUID) -> bool:
 
 
 async def prune_successful_backups(
-    store: BackupStore, owner_id: UUID, keep: int = 5
+    store: BackupStore, drive_owner_id: UUID, keep: int = 5
 ) -> list[str]:
     if keep < 0:
         raise ValueError("keep must be zero or greater")
 
-    backups = await store.list(owner_id)
+    backups = await store.list(drive_owner_id)
     eligible = sorted(
-        (backup for backup in backups if is_valid_stored_backup(backup, owner_id)),
+        (backup for backup in backups if is_valid_stored_backup(backup, drive_owner_id)),
         key=lambda backup: backup.metadata.created_at,
         reverse=True,
     )

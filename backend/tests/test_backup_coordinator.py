@@ -21,6 +21,7 @@ from app.models.user import User
 from app.services.backup_archive import BackupExportResult, BackupManifestV1
 from app.services.backup_coordinator import BackupCoordinator
 from app.services.backup_store import BackupObjectMetadata, StoredBackup
+from app.services.google_drive_oauth import derive_drive_owner_id
 from app.services.google_drive_store import GoogleDriveReauthorizationRequiredError
 
 
@@ -72,6 +73,7 @@ class RecordingStore:
         self.list_failure = list_failure
         self.backups: list[StoredBackup] = []
         self.deleted: list[str] = []
+        self.listed_drive_owner_ids: list[UUID] = []
 
     @property
     def remote_ids(self) -> set[str]:
@@ -83,7 +85,8 @@ class RecordingStore:
         returned_metadata = metadata
         if self.mismatch:
             returned_metadata = BackupObjectMetadata(
-                owner_id=uuid4(),
+                drive_owner_id=uuid4(),
+                workspace_owner_id=metadata.workspace_owner_id,
                 backup_id=metadata.backup_id,
                 schema_version=metadata.schema_version,
                 archive_checksum=metadata.archive_checksum,
@@ -100,7 +103,8 @@ class RecordingStore:
         self.backups.append(stored)
         return stored
 
-    async def list(self, owner_id: UUID) -> list[StoredBackup]:
+    async def list(self, drive_owner_id: UUID) -> list[StoredBackup]:
+        self.listed_drive_owner_ids.append(drive_owner_id)
         if self.list_failure is not None:
             raise self.list_failure
         return list(self.backups)
@@ -208,7 +212,7 @@ def _coordinator(
 async def test_successful_backup_commits_verified_metadata_and_schedule(
     session: Session, tmp_path: Path, backup_workspace: tuple[User, GoogleDriveConnection, BackupSchedule]
 ) -> None:
-    user, _, schedule = backup_workspace
+    user, connection, schedule = backup_workspace
     now = datetime(2026, 7, 24, 13, 0, tzinfo=UTC)
     store = RecordingStore()
     coordinator = _coordinator(session, tmp_path, now, store)
@@ -220,6 +224,11 @@ async def test_successful_backup_commits_verified_metadata_and_schedule(
     assert result.archive_size_bytes == len(b"backup-archive")
     assert result.checksum == "b" * 64
     assert result.item_counts == {"notes": 2}
+    assert store.backups[0].metadata.workspace_owner_id == user.portable_id
+    assert store.backups[0].metadata.drive_owner_id == derive_drive_owner_id(
+        connection.google_subject
+    )
+    assert store.listed_drive_owner_ids == [derive_drive_owner_id(connection.google_subject)]
     session.refresh(schedule)
     assert schedule.last_attempt_at == now
     assert schedule.last_success_at == now
@@ -230,7 +239,7 @@ async def test_successful_backup_commits_verified_metadata_and_schedule(
 async def test_backup_persists_exporting_and_uploading_transitions_before_completion(
     session: Session, tmp_path: Path, backup_workspace: tuple[User, GoogleDriveConnection, BackupSchedule]
 ) -> None:
-    user, _, _ = backup_workspace
+    user, connection, _ = backup_workspace
     now = datetime(2026, 7, 24, 13, 0, tzinfo=UTC)
     store = LifecycleStore(session, user.id)  # type: ignore[arg-type]
     exporter = LifecycleExporter(now, session, user.id)  # type: ignore[arg-type]
@@ -250,7 +259,7 @@ async def test_backup_persists_exporting_and_uploading_transitions_before_comple
 async def test_backup_releases_advisory_lock_after_completion(
     session: Session, tmp_path: Path, backup_workspace: tuple[User, GoogleDriveConnection, BackupSchedule]
 ) -> None:
-    user, _, _ = backup_workspace
+    user, connection, _ = backup_workspace
     coordinator = _coordinator(
         session,
         tmp_path,
@@ -276,7 +285,7 @@ async def test_backup_releases_advisory_lock_after_completion(
 async def test_failed_upload_preserves_existing_backups(
     session: Session, tmp_path: Path, backup_workspace: tuple[User, GoogleDriveConnection, BackupSchedule]
 ) -> None:
-    user, _, _ = backup_workspace
+    user, connection, _ = backup_workspace
     now = datetime(2026, 7, 24, 13, 0, tzinfo=UTC)
     failing_store = RecordingStore(failure=RuntimeError("provider body: refresh-token-secret"))
     failing_store.backups.append(
@@ -285,7 +294,14 @@ async def test_failed_upload_preserves_existing_backups(
             name="previous.zip",
             size=12,
             created_at=now - timedelta(days=1),
-            metadata=BackupObjectMetadata(user.portable_id, uuid4(), 1, "a" * 64, now - timedelta(days=1)),
+            metadata=BackupObjectMetadata(
+                drive_owner_id=derive_drive_owner_id(connection.google_subject),
+                workspace_owner_id=user.portable_id,
+                backup_id=uuid4(),
+                schema_version=1,
+                archive_checksum="a" * 64,
+                created_at=now - timedelta(days=1),
+            ),
             completed=True,
         )
     )
@@ -304,7 +320,7 @@ async def test_failed_upload_preserves_existing_backups(
 async def test_metadata_mismatch_fails_without_trusting_remote_file(
     session: Session, tmp_path: Path, backup_workspace: tuple[User, GoogleDriveConnection, BackupSchedule]
 ) -> None:
-    user, _, _ = backup_workspace
+    user, connection, _ = backup_workspace
     coordinator = _coordinator(
         session,
         tmp_path,
@@ -351,7 +367,7 @@ def test_duplicate_trigger_returns_pending_operation(
 async def test_retention_failure_keeps_completed_backup_and_sanitizes_warning(
     session: Session, tmp_path: Path, backup_workspace: tuple[User, GoogleDriveConnection, BackupSchedule]
 ) -> None:
-    user, _, _ = backup_workspace
+    user, connection, _ = backup_workspace
     now = datetime(2026, 7, 24, 13, 0, tzinfo=UTC)
     store = RecordingStore(fail_retention=True)
     for index in range(5):
@@ -362,11 +378,12 @@ async def test_retention_failure_keeps_completed_backup_and_sanitizes_warning(
                 size=12,
                 created_at=now - timedelta(days=index + 1),
                 metadata=BackupObjectMetadata(
-                    user.portable_id,
-                    uuid4(),
-                    1,
-                    f"{index:064x}",
-                    now - timedelta(days=index + 1),
+                    drive_owner_id=derive_drive_owner_id(connection.google_subject),
+                    workspace_owner_id=user.portable_id,
+                    backup_id=uuid4(),
+                    schema_version=1,
+                    archive_checksum=f"{index:064x}",
+                    created_at=now - timedelta(days=index + 1),
                 ),
                 completed=True,
             )
@@ -429,7 +446,7 @@ async def test_retention_cancellation_keeps_completed_backup_and_schedule_succes
 async def test_successful_retention_keeps_the_newest_five_snapshots(
     session: Session, tmp_path: Path, backup_workspace: tuple[User, GoogleDriveConnection, BackupSchedule]
 ) -> None:
-    user, _, _ = backup_workspace
+    user, connection, _ = backup_workspace
     now = datetime(2026, 7, 24, 13, 0, tzinfo=UTC)
     store = RecordingStore()
     for index in range(5):
@@ -440,11 +457,12 @@ async def test_successful_retention_keeps_the_newest_five_snapshots(
                 size=12,
                 created_at=now - timedelta(days=index + 1),
                 metadata=BackupObjectMetadata(
-                    user.portable_id,
-                    uuid4(),
-                    1,
-                    f"{index:064x}",
-                    now - timedelta(days=index + 1),
+                    drive_owner_id=derive_drive_owner_id(connection.google_subject),
+                    workspace_owner_id=user.portable_id,
+                    backup_id=uuid4(),
+                    schema_version=1,
+                    archive_checksum=f"{index:064x}",
+                    created_at=now - timedelta(days=index + 1),
                 ),
                 completed=True,
             )
@@ -455,6 +473,7 @@ async def test_successful_retention_keeps_the_newest_five_snapshots(
 
     assert result.status == BackupStatus.completed
     assert store.deleted == ["previous-4"]
+    assert store.listed_drive_owner_ids == [derive_drive_owner_id(connection.google_subject)]
 
 
 @pytest.mark.asyncio

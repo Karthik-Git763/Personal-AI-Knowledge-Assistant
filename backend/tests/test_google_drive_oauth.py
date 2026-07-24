@@ -31,9 +31,18 @@ from app.services.google_drive_oauth import (
     GoogleDriveOAuthRetryableError,
     GoogleDriveOAuthService,
     InvalidOAuthState,
+    derive_drive_owner_id,
 )
 
 REQUIRED_SCOPE = "https://www.googleapis.com/auth/drive.appdata"
+
+
+def test_drive_owner_id_is_stable_and_does_not_expose_google_subject() -> None:
+    first = derive_drive_owner_id("google-subject-123")
+
+    assert first == derive_drive_owner_id("google-subject-123")
+    assert first != derive_drive_owner_id("other-google-subject")
+    assert "google-subject-123" not in str(first)
 
 
 def _settings(**overrides: Any) -> Settings:

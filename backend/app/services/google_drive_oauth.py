@@ -4,6 +4,7 @@ import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlencode
+from uuid import UUID, uuid5
 
 import httpx
 from sqlmodel import Session, select
@@ -12,6 +13,13 @@ from app.core.config import Settings
 from app.core.config import settings as default_settings
 from app.core.security import decrypt_provider_token, encrypt_provider_token
 from app.models.backup import DriveConnectionStatus, GoogleDriveConnection, OAuthState
+
+COGNOLITH_DRIVE_OWNER_NAMESPACE = UUID("7dca7e10-242a-5d0f-a8a1-3a5cb7c7f19b")
+
+
+def derive_drive_owner_id(google_subject: str) -> UUID:
+    """Create the stable remote owner ID without persisting the Google subject."""
+    return uuid5(COGNOLITH_DRIVE_OWNER_NAMESPACE, google_subject)
 
 
 class InvalidOAuthState(ValueError):  # noqa: N818
