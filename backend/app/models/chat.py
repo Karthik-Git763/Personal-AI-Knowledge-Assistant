@@ -1,10 +1,12 @@
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, ClassVar
+from uuid import UUID, uuid4
 
 from pydantic import ConfigDict
 from sqlalchemy import desc
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlmodel import Column, Field, Index, Relationship, SQLModel, String
 
 if TYPE_CHECKING:
@@ -26,6 +28,10 @@ class ChatSession(TimestampMixin, SQLModel, table=True):
         Index("ix_chat_session_user_last_message", "user_id", desc("last_message_at")),
     )
     id: int | None = Field(default=None, primary_key=True)
+    portable_id: UUID = Field(
+        default_factory=uuid4,
+        sa_column=Column(PGUUID(as_uuid=True), nullable=False, unique=True, index=True),
+    )
     user_id: int | None = Field(default=None, foreign_key="users.id", nullable=False)
     title: str | None = Field(default=None, max_length=255)
     description: str | None = Field(default=None)
@@ -66,6 +72,10 @@ class ChatMessages(TimestampMixin, SQLModel, table=True):
     __table_args__ = (Index("ix_chat_messages_session_created", "session_id", desc("created_at")),)
     model_config = ConfigDict(protected_namespaces=())  # pyright: ignore[reportAssignmentType]
     id: int | None = Field(default=None, primary_key=True)
+    portable_id: UUID = Field(
+        default_factory=uuid4,
+        sa_column=Column(PGUUID(as_uuid=True), nullable=False, unique=True, index=True),
+    )
     session_id: int | None = Field(foreign_key="chat_sessions.id", nullable=False)
     role: ChatRole = Field(nullable=False, max_length=20)
     content: str = Field(nullable=False)

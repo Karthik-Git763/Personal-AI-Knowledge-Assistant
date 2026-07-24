@@ -1,8 +1,10 @@
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, ClassVar, Optional
+from uuid import UUID, uuid4
 
 from sqlalchemy import ARRAY, String, desc
+from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlmodel import (
     CheckConstraint,
     Column,
@@ -35,6 +37,10 @@ class NoteFolders(TimestampMixin, SQLModel, table=True):
         ),
     )
     id: int | None = Field(default=None, primary_key=True)
+    portable_id: UUID = Field(
+        default_factory=uuid4,
+        sa_column=Column(PGUUID(as_uuid=True), nullable=False, unique=True, index=True),
+    )
     user_id: int | None = Field(foreign_key="users.id", nullable=False, index=True)
     name: str = Field(max_length=255)
     description: str | None = Field(default=None)
@@ -114,6 +120,10 @@ class Notes(TimestampMixin, SQLModel, table=True):
         ),
     )
     id: int | None = Field(default=None, primary_key=True)
+    portable_id: UUID = Field(
+        default_factory=uuid4,
+        sa_column=Column(PGUUID(as_uuid=True), nullable=False, unique=True, index=True),
+    )
     user_id: int | None = Field(foreign_key="users.id", nullable=False)
     folder_id: int | None = Field(default=None, foreign_key="note_folders.id", index=True)
     title: str = Field(nullable=False, max_length=500)
@@ -202,6 +212,10 @@ class NoteTags(SQLModel, table=True):
         UniqueConstraint("user_id", "name", name="uix_note_tags_user_name"),
     )
     id: int = Field(primary_key=True, default=None)
+    portable_id: UUID = Field(
+        default_factory=uuid4,
+        sa_column=Column(PGUUID(as_uuid=True), nullable=False, unique=True, index=True),
+    )
     user_id: int = Field(foreign_key="users.id", nullable=False)
     name: str = Field(nullable=False, max_length=100)
     color: str | None = Field(default=None, max_length=20)
@@ -275,6 +289,10 @@ class NoteLinks(SQLModel, table=True):
         UniqueConstraint("source_note_id", "target_note_id", name="unique_note_links"),
     )
     id: int | None = Field(primary_key=True, default=None)
+    portable_id: UUID = Field(
+        default_factory=uuid4,
+        sa_column=Column(PGUUID(as_uuid=True), nullable=False, unique=True, index=True),
+    )
     source_note_id: int | None = Field(foreign_key="notes.id", nullable=False)
     target_note_id: int | None = Field(foreign_key="notes.id", nullable=False)
     link_type: NoteLinkType = Field(default=NoteLinkType.related)

@@ -1,8 +1,10 @@
 from datetime import datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, ClassVar
+from uuid import UUID, uuid4
 
 from sqlalchemy import ARRAY, String, text
+from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlmodel import Column, Field, Index, Relationship, SQLModel, UniqueConstraint
 
 from .chat import TimestampMixin
@@ -39,6 +41,10 @@ class Document(TimestampMixin, SQLModel, table=True):
         ),
     )
     id: int | None = Field(default=None, primary_key=True)
+    portable_id: UUID = Field(
+        default_factory=uuid4,
+        sa_column=Column(PGUUID(as_uuid=True), nullable=False, unique=True, index=True),
+    )
     user_id: int | None = Field(foreign_key="users.id", nullable=False)
     title: str = Field(nullable=False, max_length=255)
     file_name: str = Field(nullable=False, max_length=255)

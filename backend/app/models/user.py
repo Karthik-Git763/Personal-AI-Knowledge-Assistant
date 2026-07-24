@@ -12,6 +12,7 @@ from app.utils.sanitization import sanitize_plain_text
 from .chat import TimestampMixin
 
 if TYPE_CHECKING:
+    from .backup import BackupSchedule, GoogleDriveConnection, OAuthState, WorkspaceBackup
     from .chat import ChatSession
     from .document import Document
     from .note import NoteCollaborators, NoteFolders, Notes, NoteTags, NoteTemplates
@@ -134,6 +135,20 @@ class User(TimestampMixin, UserBase, SQLModel, table=True):
     chat_sessions: list["ChatSession"] = Relationship(back_populates="user")
     activity_logs: list["ActivityLogs"] = Relationship(back_populates="user")
     note_collaborations: list["NoteCollaborators"] = Relationship(back_populates="user")
+    google_drive_connection: Optional["GoogleDriveConnection"] = Relationship(
+        back_populates="user",
+        sa_relationship_kwargs={"uselist": False, "cascade": "all, delete-orphan"},
+    )
+    oauth_states: list["OAuthState"] = Relationship(
+        back_populates="user", sa_relationship_kwargs={"cascade": "all, delete-orphan"}
+    )
+    workspace_backups: list["WorkspaceBackup"] = Relationship(
+        back_populates="user", sa_relationship_kwargs={"cascade": "all, delete-orphan"}
+    )
+    backup_schedule: Optional["BackupSchedule"] = Relationship(
+        back_populates="user",
+        sa_relationship_kwargs={"uselist": False, "cascade": "all, delete-orphan"},
+    )
 
 
 class EmailVerificationCode(SQLModel, table=True):
