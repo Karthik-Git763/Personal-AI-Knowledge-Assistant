@@ -265,7 +265,7 @@ class GoogleDriveOAuthService:
     def _raise_for_oauth_error(response: httpx.Response, failure_message: str) -> None:
         if response.status_code == 429 or response.status_code >= 500:
             raise GoogleDriveOAuthRetryableError(failure_message)
-        if response.status_code == 401 or GoogleDriveOAuthService._is_invalid_grant(response):
+        if response.status_code in {401, 403} or GoogleDriveOAuthService._is_invalid_grant(response):
             raise GoogleDriveOAuthReauthorizationRequiredError(failure_message)
         if response.is_error:
             raise GoogleDriveOAuthError(failure_message)

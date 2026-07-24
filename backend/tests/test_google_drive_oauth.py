@@ -505,7 +505,7 @@ async def test_refresh_access_token_maps_transport_error_to_retryable_error(sess
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("status", "payload"),
-    [(401, {}), (400, {"error": "invalid_grant"})],
+    [(401, {}), (403, {}), (400, {"error": "invalid_grant"})],
 )
 async def test_refresh_access_token_maps_revocation_to_reauthorization_error(
     session: Session, status: int, payload: dict[str, str]

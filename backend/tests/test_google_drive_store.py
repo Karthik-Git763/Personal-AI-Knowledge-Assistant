@@ -118,12 +118,17 @@ def _stored_backup(metadata: BackupObjectMetadata) -> StoredBackup:
 
 
 async def _store(
-    session: Session, settings: Settings, handler: httpx.MockTransport | Any
+    session: Session,
+    settings: Settings,
+    handler: httpx.MockTransport | Any,
+    *,
+    with_session: bool = False,
 ) -> tuple[GoogleDriveStore, UUID]:
     owner_id, connection = _connection(session, settings)
     transport = handler if isinstance(handler, httpx.MockTransport) else httpx.MockTransport(handler)
     client = httpx.AsyncClient(transport=transport)
     oauth_service = GoogleDriveOAuthService(session=session, client=client, settings=settings)
+    store_kwargs: dict[str, Session] = {"session": session} if with_session else {}
     return (
         GoogleDriveStore(
             owner_id=owner_id,
@@ -131,6 +136,7 @@ async def _store(
             oauth_service=oauth_service,
             client=client,
             settings=settings,
+            **store_kwargs,
         ),
         owner_id,
     )
@@ -430,7 +436,9 @@ async def test_delete_accepts_only_locally_validated_backup_identity(
         assert request.method == "DELETE"
         return httpx.Response(204)
 
-    store, owner_id = await _store(session, configured_token_encryption, handler)
+    store, owner_id = await _store(
+        session, configured_token_encryption, handler, with_session=True
+    )
     backup = _stored_backup(_metadata(owner_id))
     workspace_backup = WorkspaceBackup(
         user_id=store.connection.user_id,
@@ -440,9 +448,34 @@ async def test_delete_accepts_only_locally_validated_backup_identity(
         archive_size_bytes=len(ARCHIVE_BYTES),
         checksum=CHECKSUM,
     )
+    session.add(workspace_backup)
+    session.commit()
+    session.refresh(workspace_backup)
+    assert workspace_backup.id is not None
+    unpersisted = WorkspaceBackup(
+        user_id=store.connection.user_id,
+        remote_file_id=REMOTE_ID,
+        status=BackupStatus.completed,
+        schema_version=1,
+        archive_size_bytes=len(ARCHIVE_BYTES),
+        checksum=CHECKSUM,
+    )
+    detached = WorkspaceBackup(
+        id=workspace_backup.id,
+        user_id=store.connection.user_id,
+        remote_file_id="detached_file_12345",
+        status=BackupStatus.completed,
+        schema_version=1,
+        archive_size_bytes=len(ARCHIVE_BYTES),
+        checksum=CHECKSUM,
+    )
     try:
         with pytest.raises(TypeError):
             store.authorize_backup(REMOTE_ID)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="persisted"):
+            store.authorize_backup(unpersisted)
+        with pytest.raises(ValueError, match="persisted"):
+            store.authorize_backup(detached)
         store.authorize_backup(backup)
         await store.delete(REMOTE_ID)
         store.authorize_backup(workspace_backup)

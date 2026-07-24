@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 from uuid import UUID
 
 import httpx
+from sqlmodel import Session, select
 
 from app.core.config import Settings
 from app.core.config import settings as default_settings
@@ -63,12 +64,14 @@ class GoogleDriveStore:
         oauth_service: GoogleDriveOAuthService,
         client: httpx.AsyncClient | None = None,
         settings: Settings = default_settings,
+        session: Session | None = None,
     ) -> None:
         self.owner_id = owner_id
         self.connection = connection
         self.oauth_service = oauth_service
         self.client = client or httpx.AsyncClient(timeout=30.0)
         self.settings = settings
+        self.session = session
         self._trusted_remote_ids: set[str] = set()
 
     async def aclose(self) -> None:
@@ -212,22 +215,34 @@ class GoogleDriveStore:
                 raise ValueError("Stored backup is not valid for this owner")
             remote_id = backup.remote_id
         elif isinstance(backup, WorkspaceBackup):
-            remote_id = backup.remote_file_id
-            if (
-                backup.user_id != self.connection.user_id
-                or backup.status != BackupStatus.completed
-                or not remote_id
-                or backup.schema_version < 1
-                or backup.archive_size_bytes is None
-                or backup.archive_size_bytes < 0
-                or not backup.checksum
-                or not self._CHECKSUM.fullmatch(backup.checksum)
-            ):
-                raise ValueError("Workspace backup is not a validated completed backup")
+            remote_id = self._validated_workspace_backup_remote_id(backup)
         else:
             raise TypeError("Backup authorization requires a stored or workspace backup")
         self._validate_remote_id(remote_id)
         self._trusted_remote_ids.add(remote_id)
+
+    def _validated_workspace_backup_remote_id(self, backup: WorkspaceBackup) -> str:
+        if self.session is None or backup.id is None or not backup.remote_file_id:
+            raise ValueError("Workspace backup must be a persisted validated record")
+        record = self.session.exec(
+            select(WorkspaceBackup).where(
+                WorkspaceBackup.id == backup.id,
+                WorkspaceBackup.user_id == self.connection.user_id,
+                WorkspaceBackup.remote_file_id == backup.remote_file_id,
+                WorkspaceBackup.status == BackupStatus.completed,
+            )
+        ).one_or_none()
+        if (
+            record is None
+            or record.schema_version < 1
+            or record.archive_size_bytes is None
+            or record.archive_size_bytes < 0
+            or not record.checksum
+            or not self._CHECKSUM.fullmatch(record.checksum)
+            or not record.remote_file_id
+        ):
+            raise ValueError("Workspace backup must be a persisted validated record")
+        return record.remote_file_id
 
     async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         headers = dict(kwargs.pop("extra_headers", {}))

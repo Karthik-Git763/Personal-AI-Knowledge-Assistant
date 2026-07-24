@@ -50,3 +50,24 @@ Self-review:
 
 Concerns:
 - No remaining implementation concerns identified; task-level backup record coordination and scheduling remain intentionally out of scope.
+
+## Final Review Finding Remediation
+
+Status: complete
+
+Changes:
+- `authorize_backup` now requires an injected session for `WorkspaceBackup` authorization and re-queries a non-null primary key, connection-owner user ID, remote ID, and completed status before trusting the canonical persisted record.
+- Unpersisted and detached/arbitrary workspace objects are rejected; a committed owner-matching completed record remains accepted.
+- Direct OAuth 403 responses now use the same reauthorization-required classification as 401 and `invalid_grant`.
+
+RED/GREEN evidence:
+- RED: the new provenance test initially could not construct the store with its required session boundary, and direct 403 refresh classification did not meet the reauthorization contract.
+- GREEN: `docker compose exec backend pytest -q tests/test_google_drive_store.py tests/test_backup_retention.py tests/test_google_drive_oauth.py` completed successfully after the session-backed lookup and 403 classification changes.
+- Static checks: focused Ruff completed with `All checks passed!`; BasedPyright completed with `0 errors, 0 warnings, 0 notes`.
+
+Self-review:
+- Verified the trusted remote ID comes from the database result rather than caller-provided workspace fields.
+- Verified no new provider SDK, network test mechanism, or backup scheduling scope was introduced.
+
+Concerns:
+- The focused suite must run serially because the repository's session fixture recreates shared PostgreSQL enum types; parallel pytest invocations can race during schema setup.
