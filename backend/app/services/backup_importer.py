@@ -17,10 +17,15 @@ from typing import Any
 from uuid import UUID, uuid4
 from zipfile import ZIP_DEFLATED, ZIP_STORED, BadZipFile, ZipFile, ZipInfo
 
-from sqlalchemy import delete, or_
+from sqlalchemy import delete, or_, text
 from sqlmodel import Session, col, select
 
 from app.core.config import settings
+from app.models.backup import (
+    BackupOperationKind,
+    BackupStatus,
+    WorkspaceBackup,
+)
 from app.models.chat import ChatMessages, ChatRole, ChatSession
 from app.models.document import Document, DocumentChunks
 from app.models.note import (
@@ -66,6 +71,13 @@ class _ValidatedArchive:
     checksums: dict[str, str]
     records: dict[str, list[dict[str, Any]]]
     document_entries: dict[UUID, str]
+
+
+@dataclass(frozen=True)
+class _OpenedDestination:
+    path: Path
+    descriptor: int
+    parent_descriptor: int | None
 
 
 _MANIFEST_FIELDS = {
@@ -312,6 +324,9 @@ _MAX_STRING_LENGTHS = {
 
 
 class BackupImporter:
+    _GLOBAL_RESTORE_LOCK_NAMESPACE = 7_327_502
+    _GLOBAL_RESTORE_LOCK_ID = 1
+
     def __init__(
         self,
         *,
@@ -342,7 +357,7 @@ class BackupImporter:
         self.upload_root = Path(upload_root or settings.UPLOAD_DIR)
         self.temporary_directory = Path(temporary_directory or settings.BACKUP_TEMP_DIR)
         self.session = session
-        self.move_file = move_file or self._replace_file
+        self.move_file = move_file
 
     def preview(self, path: Path, expected_workspace_owner_id: UUID) -> BackupPreview:
         archive_path = Path(path)
@@ -361,18 +376,31 @@ class BackupImporter:
         path: Path,
         user: User,
         expected_workspace_owner_id: UUID,
+        *,
+        operation: WorkspaceBackup,
+        completed_at: datetime,
     ) -> RestoreResult:
         if self.session is None or user.id is None:
             raise BackupRestoreFailed("Restore requires a persisted user and database session")
-        validated = self._validate(Path(path), expected_workspace_owner_id)
-        self._recover_incomplete_restores()
+        self._validate_restore_operation(operation, user.id)
+        if not self._try_global_restore_lock():
+            self.session.rollback()
+            raise BackupRestoreFailed("Another workspace restore is in progress")
+        archive_path = Path(path)
+        try:
+            validated = self._validate(archive_path, expected_workspace_owner_id)
+        except BaseException:
+            self.session.rollback()
+            raise
 
         restore_directory: Path | None = None
+        journal: Path | None = None
         final_paths: list[Path] = []
         old_paths: list[str] = []
         try:
+            self._recover_incomplete_restores()
             restore_directory = self._create_restore_directory()
-            staged = self._stage_documents(Path(path), validated, restore_directory)
+            staged = self._stage_documents(archive_path, validated, restore_directory)
             planned = self._plan_final_paths(user.id, validated)
             journal = restore_directory / "recovery-journal.json"
             self._write_recovery_journal(journal, list(planned.values()))
@@ -381,9 +409,14 @@ class BackupImporter:
             old_paths = self._old_document_paths(user.id)
             self._delete_workspace(user.id)
             reprocessing_ids = self._insert_workspace(user.id, validated, planned)
+            operation.status = BackupStatus.completed
+            operation.completed_at = completed_at
+            operation.failure_message = None
+            operation.schema_version = validated.schema_version
+            operation.archive_size_bytes = archive_path.stat().st_size
+            operation.item_counts = dict(validated.counts)
+            self.session.add(operation)
             self.session.commit()
-            self.session.expire_all()
-            journal.unlink(missing_ok=True)
         except BaseException as error:
             self.session.rollback()
             self._remove_new_files(final_paths)
@@ -393,10 +426,44 @@ class BackupImporter:
                 raise
             raise BackupRestoreFailed("Workspace restore failed") from error
 
+        if journal is not None:
+            try:
+                journal.unlink(missing_ok=True)
+            except OSError:
+                pass
         if restore_directory is not None:
             shutil.rmtree(restore_directory, ignore_errors=True)
         self._delete_old_files(old_paths)
         return RestoreResult(reprocessing_document_ids=reprocessing_ids)
+
+    @staticmethod
+    def _validate_restore_operation(
+        operation: WorkspaceBackup, user_id: int
+    ) -> None:
+        if (
+            operation.id is None
+            or operation.user_id != user_id
+            or operation.operation_kind != BackupOperationKind.restore
+            or operation.status != BackupStatus.pending
+        ):
+            raise BackupRestoreFailed("Restore operation is invalid")
+
+    def _try_global_restore_lock(self) -> bool:
+        if self.session is None:
+            return False
+        return bool(
+            self.session.connection()
+            .execute(
+                text(
+                    "SELECT pg_try_advisory_xact_lock(:namespace, :lock_id)"
+                ),
+                {
+                    "namespace": self._GLOBAL_RESTORE_LOCK_NAMESPACE,
+                    "lock_id": self._GLOBAL_RESTORE_LOCK_ID,
+                },
+            )
+            .scalar_one()
+        )
 
     def _validate(self, path: Path, expected_workspace_owner_id: UUID) -> _ValidatedArchive:
         self._validate_archive_file(path)
@@ -444,7 +511,12 @@ class BackupImporter:
         normalized_names: set[str] = set()
         expanded_size = 0
         for info in infos:
+            raw_name = self._safe_entry_name(info.orig_filename)
             name = self._safe_entry_name(info.filename)
+            if raw_name != name:
+                raise UnsafeBackupArchive(
+                    "Backup archive raw path is unsafe"
+                )
             normalized = unicodedata.normalize("NFKC", name).casefold()
             if normalized in normalized_names:
                 raise UnsafeBackupArchive("Backup archive contains duplicate entries")
@@ -832,11 +904,13 @@ class BackupImporter:
     def _plan_final_paths(
         self, user_id: int, validated: _ValidatedArchive
     ) -> dict[UUID, Path]:
+        self.upload_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        root = self.upload_root.resolve(strict=True)
         records = {
             self._uuid(record["id"]): record for record in validated.records["documents"]
         }
         return {
-            identifier: self.upload_root
+            identifier: root
             / str(user_id)
             / f"{uuid4().hex}-{records[identifier]['file_name']}"
             for identifier in validated.document_entries
@@ -861,25 +935,149 @@ class BackupImporter:
         created_paths: list[Path],
     ) -> None:
         for identifier, source in staged.items():
-            destination = planned[identifier]
-            destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            descriptor = os.open(
-                destination,
-                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                0o600,
+            opened = self._open_destination(planned[identifier])
+            created_paths.append(opened.path)
+            try:
+                if self.move_file is None:
+                    self._replace_file(source, opened)
+                else:
+                    self.move_file(source, opened.path)
+            finally:
+                os.close(opened.descriptor)
+                if opened.parent_descriptor is not None:
+                    os.close(opened.parent_descriptor)
+
+    def _open_destination(self, destination: Path) -> _OpenedDestination:
+        root = self.upload_root.resolve(strict=True)
+        try:
+            relative = destination.relative_to(root)
+        except ValueError as error:
+            raise BackupRestoreFailed(
+                "Restore destination is outside the upload directory"
+            ) from error
+        if not relative.parts or any(
+            part in {"", ".", ".."} for part in relative.parts
+        ):
+            raise BackupRestoreFailed("Restore destination is unsafe")
+        parent_parts = relative.parts[:-1]
+        if self._supports_directory_descriptors():
+            return self._open_destination_at(
+                root, parent_parts, relative.parts[-1]
             )
-            os.close(descriptor)
-            created_paths.append(destination)
-            self.move_file(source, destination)
+        return self._open_destination_by_path(
+            root, parent_parts, relative.parts[-1]
+        )
 
     @staticmethod
-    def _replace_file(source: Path, destination: Path) -> None:
+    def _supports_directory_descriptors() -> bool:
+        return (
+            os.open in os.supports_dir_fd
+            and os.mkdir in os.supports_dir_fd
+            and os.replace in os.supports_dir_fd
+            and hasattr(os, "O_DIRECTORY")
+            and hasattr(os, "O_NOFOLLOW")
+        )
+
+    def _open_destination_at(
+        self, root: Path, parent_parts: tuple[str, ...], name: str
+    ) -> _OpenedDestination:
+        directory_flags = (
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        )
+        directory_descriptor = os.open(root, directory_flags)
         try:
-            os.replace(source, destination)
+            for part in parent_parts:
+                try:
+                    os.mkdir(
+                        part,
+                        mode=0o700,
+                        dir_fd=directory_descriptor,
+                    )
+                except FileExistsError:
+                    pass
+                next_descriptor = os.open(
+                    part,
+                    directory_flags,
+                    dir_fd=directory_descriptor,
+                )
+                os.close(directory_descriptor)
+                directory_descriptor = next_descriptor
+            parent = root.joinpath(*parent_parts).resolve(strict=True)
+            parent.relative_to(root)
+            descriptor = os.open(
+                name,
+                os.O_CREAT
+                | os.O_EXCL
+                | os.O_WRONLY
+                | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=directory_descriptor,
+            )
+        except BaseException:
+            os.close(directory_descriptor)
+            raise
+        return _OpenedDestination(
+            path=parent / name,
+            descriptor=descriptor,
+            parent_descriptor=directory_descriptor,
+        )
+
+    @staticmethod
+    def _open_destination_by_path(
+        root: Path, parent_parts: tuple[str, ...], name: str
+    ) -> _OpenedDestination:
+        parent = root
+        for part in parent_parts:
+            candidate = parent / part
+            try:
+                candidate.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            if candidate.is_symlink() or not candidate.is_dir():
+                raise BackupRestoreFailed(
+                    "Restore destination parent is unsafe"
+                )
+            parent = candidate.resolve(strict=True)
+            try:
+                parent.relative_to(root)
+            except ValueError as error:
+                raise BackupRestoreFailed(
+                    "Restore destination parent is outside the upload directory"
+                ) from error
+        destination = parent / name
+        descriptor = os.open(
+            destination,
+            os.O_CREAT
+            | os.O_EXCL
+            | os.O_WRONLY
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        return _OpenedDestination(
+            path=destination,
+            descriptor=descriptor,
+            parent_descriptor=None,
+        )
+
+    @staticmethod
+    def _replace_file(
+        source: Path, destination: _OpenedDestination
+    ) -> None:
+        try:
+            if destination.parent_descriptor is None:
+                os.replace(source, destination.path)
+            else:
+                os.replace(
+                    source,
+                    destination.path.name,
+                    dst_dir_fd=destination.parent_descriptor,
+                )
         except OSError as error:
             if error.errno != errno.EXDEV:
                 raise
-            with source.open("rb") as input_file, destination.open("wb") as output:
+            with source.open("rb") as input_file, os.fdopen(
+                os.dup(destination.descriptor), "wb"
+            ) as output:
                 shutil.copyfileobj(input_file, output, length=64 * 1024)
                 output.flush()
                 os.fsync(output.fileno())

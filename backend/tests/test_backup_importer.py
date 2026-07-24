@@ -136,6 +136,38 @@ def test_preview_rejects_unsafe_paths(
         importer.preview(archive, expected_workspace_owner_id=owner_id)
 
 
+def test_preview_rejects_nul_in_raw_zip_entry_name(
+    importer: BackupImporter, tmp_path: Path, owner_id: UUID
+) -> None:
+    valid = _write_archive(tmp_path / "valid.zip", owner_id=owner_id)
+    crafted = tmp_path / "raw-nul.zip"
+    with ZipFile(valid) as source, ZipFile(
+        crafted, "w", ZIP_DEFLATED
+    ) as output:
+        for info in source.infolist():
+            name = (
+                "notes.jsonAAAAA"
+                if info.filename == "notes.json"
+                else info.filename
+            )
+            output.writestr(name, source.read(info))
+    raw = crafted.read_bytes()
+    assert raw.count(b"notes.jsonAAAAA") == 2
+    crafted.write_bytes(
+        raw.replace(b"notes.jsonAAAAA", b"notes.json\x00evil")
+    )
+    with ZipFile(crafted) as source:
+        notes = next(
+            info
+            for info in source.infolist()
+            if info.filename == "notes.json"
+        )
+        assert notes.orig_filename == "notes.json\x00evil"
+
+    with pytest.raises(UnsafeBackupArchive):
+        importer.preview(crafted, expected_workspace_owner_id=owner_id)
+
+
 def test_preview_rejects_duplicate_normalized_names(
     importer: BackupImporter, tmp_path: Path, owner_id: UUID
 ) -> None:

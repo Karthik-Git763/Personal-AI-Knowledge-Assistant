@@ -84,6 +84,9 @@ class BackupImporterProtocol(Protocol):
         path: Path,
         user: User,
         expected_workspace_owner_id: UUID,
+        *,
+        operation: WorkspaceBackup,
+        completed_at: datetime,
     ) -> RestoreResult: ...
 
 
@@ -173,6 +176,11 @@ class BackupCoordinator:
     async def preview_restore(
         self, user_id: int, backup_id: UUID
     ) -> BackupPreview:
+        """Validate restore metadata without mutating workspace rows or files.
+
+        Storage access may persist valid OAuth token-refresh bookkeeping on the
+        Google Drive connection.
+        """
         temporary_path: Path | None = None
         store: BackupStore | None = None
         try:
@@ -239,7 +247,7 @@ class BackupCoordinator:
                         archive = await self._download_verified_source(
                             store, stored, source, temporary_path
                         )
-                        preview = self.importer_factory(session).preview(
+                        self.importer_factory(session).preview(
                             archive,
                             expected_workspace_owner_id=(
                                 stored.metadata.workspace_owner_id
@@ -261,26 +269,18 @@ class BackupCoordinator:
                                 "Safety backup did not complete"
                             )
 
+                        operation = self._restore_operation(
+                            session, restore_operation_id
+                        )
                         self.importer_factory(session).restore(
                             archive,
                             user,
                             expected_workspace_owner_id=(
                                 stored.metadata.workspace_owner_id
                             ),
+                            operation=operation,
+                            completed_at=self.clock(),
                         )
-                        operation = self._restore_operation(
-                            session, restore_operation_id
-                        )
-                        operation.status = BackupStatus.completed
-                        operation.completed_at = self.clock()
-                        operation.failure_message = None
-                        operation.schema_version = preview.schema_version
-                        operation.archive_size_bytes = (
-                            preview.archive_size_bytes
-                        )
-                        operation.item_counts = preview.item_counts
-                        session.add(operation)
-                        session.commit()
                         return BackupOperationStatusResponse(
                             status=operation.status,
                             backup_id=operation.backup_id,
@@ -554,6 +554,8 @@ class BackupCoordinator:
             return
         operation = session.get(WorkspaceBackup, operation_id)
         if operation is None:
+            return
+        if operation.status == BackupStatus.completed:
             return
         operation.status = BackupStatus.failed
         operation.completed_at = self.clock()

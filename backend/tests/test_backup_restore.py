@@ -3,8 +3,11 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+from collections.abc import Generator, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
 from typing import Any
 from uuid import UUID, uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -13,6 +16,7 @@ import pytest
 from sqlalchemy import event
 from sqlmodel import Session, col, select
 
+from app.core.database import engine
 from app.models.backup import (
     BackupOperationKind,
     BackupSchedule,
@@ -416,6 +420,23 @@ def _importer(
     )
 
 
+def _pending_restore_operation(
+    session: Session, user_id: int
+) -> WorkspaceBackup:
+    operation = WorkspaceBackup(
+        user_id=user_id,
+        operation_kind=BackupOperationKind.restore,
+        source_backup_id=uuid4(),
+        status=BackupStatus.pending,
+        trigger=BackupTrigger.manual,
+        started_at=datetime(2026, 7, 24, 13, 0, tzinfo=UTC),
+    )
+    session.add(operation)
+    session.commit()
+    session.refresh(operation)
+    return operation
+
+
 def _snapshot_workspace(session: Session, user_id: int) -> tuple[Any, ...]:
     notes = session.exec(
         select(Notes).where(Notes.user_id == user_id).order_by(col(Notes.portable_id))
@@ -444,13 +465,17 @@ def test_restore_replaces_workspace_and_remaps_relationships(
     session: Session, restore_workspace: dict[str, Any]
 ) -> None:
     user: User = restore_workspace["user"]
+    assert user.id is not None
     original_user_portable_id = user.portable_id
     importer = _importer(session, restore_workspace)
+    operation = _pending_restore_operation(session, user.id)
 
     result = importer.restore(
         restore_workspace["archive"],
         user,
         expected_workspace_owner_id=restore_workspace["archive_owner_id"],
+        operation=operation,
+        completed_at=datetime(2026, 7, 24, 14, 0, tzinfo=UTC),
     )
 
     session.refresh(user)
@@ -533,10 +558,94 @@ def test_restore_replaces_workspace_and_remaps_relationships(
     assert not list(restore_workspace["temp_root"].glob("restore-*"))
 
 
+def test_restore_success_cannot_leave_operation_stale_pending(
+    session: Session, restore_workspace: dict[str, Any]
+) -> None:
+    user: User = restore_workspace["user"]
+    assert user.id is not None
+    operation = _pending_restore_operation(session, user.id)
+    assert operation.id is not None
+    completed_at = datetime(2026, 7, 24, 14, 0, tzinfo=UTC)
+    importer = _importer(session, restore_workspace)
+
+    importer.restore(
+        restore_workspace["archive"],
+        user,
+        expected_workspace_owner_id=restore_workspace["archive_owner_id"],
+        operation=operation,
+        completed_at=completed_at,
+    )
+
+    with Session(engine) as verification_session:
+        persisted = verification_session.get(WorkspaceBackup, operation.id)
+        assert persisted is not None
+        assert persisted.status == BackupStatus.completed
+        assert persisted.completed_at == completed_at
+        assert persisted.failure_message is None
+        assert persisted.schema_version == 1
+        assert persisted.archive_size_bytes == restore_workspace["archive"].stat().st_size
+        assert persisted.item_counts == {
+            "folders": 2,
+            "tags": 1,
+            "documents": 1,
+            "chat_sessions": 1,
+            "chat_messages": 1,
+            "notes": 2,
+            "note_tag_relations": 1,
+            "links": 1,
+            "templates": 1,
+            "user_preferences": 1,
+        }
+        restored_note = verification_session.exec(
+            select(Notes).where(
+                Notes.user_id == user.id,
+                Notes.portable_id
+                == restore_workspace["identifiers"]["note"],
+            )
+        ).one()
+        assert restored_note.title == "Restored note"
+
+
+def test_post_commit_journal_cleanup_failure_keeps_completed_restore(
+    session: Session,
+    restore_workspace: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user: User = restore_workspace["user"]
+    assert user.id is not None
+    operation = _pending_restore_operation(session, user.id)
+    original_unlink = Path.unlink
+
+    def fail_journal_unlink(
+        path: Path, *args: Any, **kwargs: Any
+    ) -> None:
+        if path.name == "recovery-journal.json":
+            raise OSError("injected post-commit journal cleanup failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_journal_unlink)
+    importer = _importer(session, restore_workspace)
+
+    result = importer.restore(
+        restore_workspace["archive"],
+        user,
+        expected_workspace_owner_id=restore_workspace["archive_owner_id"],
+        operation=operation,
+        completed_at=datetime(2026, 7, 24, 14, 0, tzinfo=UTC),
+    )
+
+    session.refresh(operation)
+    assert operation.status == BackupStatus.completed
+    restored = session.get(Document, result.reprocessing_document_ids[0])
+    assert restored is not None
+    assert Path(restored.file_path).read_bytes() == b"restored document"
+
+
 def test_restore_failure_keeps_workspace_and_files_unchanged(
     session: Session, restore_workspace: dict[str, Any]
 ) -> None:
     user: User = restore_workspace["user"]
+    assert user.id is not None
     before = _snapshot_workspace(session, user.id)  # type: ignore[arg-type]
 
     class FailingImporter(BackupImporter):
@@ -549,12 +658,15 @@ def test_restore_failure_keeps_workspace_and_files_unchanged(
         temporary_directory=restore_workspace["temp_root"],
         supported_app_versions={"0.1.0"},
     )
+    operation = _pending_restore_operation(session, user.id)
 
     with pytest.raises(BackupRestoreFailed):
         importer.restore(
             restore_workspace["archive"],
             user,
             expected_workspace_owner_id=restore_workspace["archive_owner_id"],
+            operation=operation,
+            completed_at=datetime(2026, 7, 24, 14, 0, tzinfo=UTC),
         )
 
     assert _snapshot_workspace(session, user.id) == before  # type: ignore[arg-type]
@@ -571,18 +683,22 @@ def test_restore_move_failure_rolls_back_without_new_files(
     session: Session, restore_workspace: dict[str, Any]
 ) -> None:
     user: User = restore_workspace["user"]
+    assert user.id is not None
     before = _snapshot_workspace(session, user.id)  # type: ignore[arg-type]
 
     def fail_move(source: Path, destination: Path) -> None:
         raise OSError("injected move failure")
 
     importer = _importer(session, restore_workspace, move_file=fail_move)
+    operation = _pending_restore_operation(session, user.id)
 
     with pytest.raises(BackupRestoreFailed):
         importer.restore(
             restore_workspace["archive"],
             user,
             expected_workspace_owner_id=restore_workspace["archive_owner_id"],
+            operation=operation,
+            completed_at=datetime(2026, 7, 24, 14, 0, tzinfo=UTC),
         )
 
     assert _snapshot_workspace(session, user.id) == before  # type: ignore[arg-type]
@@ -596,7 +712,9 @@ def test_restore_commit_failure_removes_moved_files_and_rolls_back(
     session: Session, restore_workspace: dict[str, Any]
 ) -> None:
     user: User = restore_workspace["user"]
+    assert user.id is not None
     before = _snapshot_workspace(session, user.id)  # type: ignore[arg-type]
+    operation = _pending_restore_operation(session, user.id)
 
     def fail_commit(database_session: Session) -> None:
         raise RuntimeError("injected commit failure")
@@ -608,6 +726,8 @@ def test_restore_commit_failure_removes_moved_files_and_rolls_back(
             restore_workspace["archive"],
             user,
             expected_workspace_owner_id=restore_workspace["archive_owner_id"],
+            operation=operation,
+            completed_at=datetime(2026, 7, 24, 14, 0, tzinfo=UTC),
         )
 
     assert _snapshot_workspace(session, user.id) == before  # type: ignore[arg-type]
@@ -621,6 +741,7 @@ def test_restore_rechecks_document_checksum_while_staging(
     session: Session, restore_workspace: dict[str, Any]
 ) -> None:
     user: User = restore_workspace["user"]
+    assert user.id is not None
     before = _snapshot_workspace(session, user.id)  # type: ignore[arg-type]
 
     class MutatingImporter(BackupImporter):
@@ -646,12 +767,15 @@ def test_restore_rechecks_document_checksum_while_staging(
         temporary_directory=restore_workspace["temp_root"],
         supported_app_versions={"0.1.0"},
     )
+    operation = _pending_restore_operation(session, user.id)
 
     with pytest.raises(BackupRestoreFailed):
         importer.restore(
             restore_workspace["archive"],
             user,
             expected_workspace_owner_id=restore_workspace["archive_owner_id"],
+            operation=operation,
+            completed_at=datetime(2026, 7, 24, 14, 0, tzinfo=UTC),
         )
 
     assert _snapshot_workspace(session, user.id) == before  # type: ignore[arg-type]
@@ -664,23 +788,57 @@ def test_restore_falls_back_to_copy_for_cross_device_move(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     user: User = restore_workspace["user"]
+    assert user.id is not None
 
-    def cross_device(source: Path, destination: Path) -> None:
+    def cross_device(
+        source: Path, destination: Path, **kwargs: Any
+    ) -> None:
         raise OSError(errno.EXDEV, "cross-device link")
 
     monkeypatch.setattr("app.services.backup_importer.os.replace", cross_device)
     importer = _importer(session, restore_workspace)
+    operation = _pending_restore_operation(session, user.id)
 
     result = importer.restore(
         restore_workspace["archive"],
         user,
         expected_workspace_owner_id=restore_workspace["archive_owner_id"],
+        operation=operation,
+        completed_at=datetime(2026, 7, 24, 14, 0, tzinfo=UTC),
     )
 
     assert len(result.reprocessing_document_ids) == 1
     restored = session.get(Document, result.reprocessing_document_ids[0])
     assert restored is not None
     assert Path(restored.file_path).read_bytes() == b"restored document"
+
+
+def test_restore_rejects_symlinked_user_destination_parent(
+    session: Session,
+    restore_workspace: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    user: User = restore_workspace["user"]
+    assert user.id is not None
+    before = _snapshot_workspace(session, user.id)
+    outside = tmp_path / "outside-upload"
+    outside.mkdir()
+    user_directory = restore_workspace["upload_root"] / str(user.id)
+    user_directory.symlink_to(outside, target_is_directory=True)
+    operation = _pending_restore_operation(session, user.id)
+    importer = _importer(session, restore_workspace)
+
+    with pytest.raises(BackupRestoreFailed):
+        importer.restore(
+            restore_workspace["archive"],
+            user,
+            expected_workspace_owner_id=restore_workspace["archive_owner_id"],
+            operation=operation,
+            completed_at=datetime(2026, 7, 24, 14, 0, tzinfo=UTC),
+        )
+
+    assert list(outside.iterdir()) == []
+    assert _snapshot_workspace(session, user.id) == before
 
 
 def test_restore_keeps_old_file_referenced_by_equivalent_surviving_path(
@@ -696,22 +854,134 @@ def test_restore_keeps_old_file_referenced_by_equivalent_surviving_path(
     session.add(other_document)
     session.commit()
     user: User = restore_workspace["user"]
+    assert user.id is not None
     importer = _importer(session, restore_workspace)
+    operation = _pending_restore_operation(session, user.id)
 
     importer.restore(
         restore_workspace["archive"],
         user,
         expected_workspace_owner_id=restore_workspace["archive_owner_id"],
+        operation=operation,
+        completed_at=datetime(2026, 7, 24, 14, 0, tzinfo=UTC),
     )
 
     assert restore_workspace["old_file"].read_bytes() == b"old document"
 
 
+def test_concurrent_user_restore_cannot_recover_live_journal(
+    session: Session, restore_workspace: dict[str, Any], tmp_path: Path
+) -> None:
+    first_user: User = restore_workspace["user"]
+    second_user: User = restore_workspace["other_user"]
+    assert first_user.id is not None
+    assert second_user.id is not None
+    second_records, _ = _restore_records()
+    second_owner_id = uuid4()
+    second_archive = _write_restore_archive(
+        tmp_path / "second-restore.zip",
+        second_owner_id,
+        second_records,
+    )
+    first_operation = _pending_restore_operation(session, first_user.id)
+    second_operation = _pending_restore_operation(session, second_user.id)
+    assert first_operation.id is not None
+    assert second_operation.id is not None
+    first_moved = Event()
+    release_first = Event()
+    second_recovery_entered = Event()
+
+    class PausingImporter(BackupImporter):
+        def _move_staged_documents(
+            self,
+            staged: Mapping[UUID, Path],
+            planned: Mapping[UUID, Path],
+            created_paths: list[Path],
+        ) -> None:
+            super()._move_staged_documents(staged, planned, created_paths)
+            first_moved.set()
+            if not release_first.wait(timeout=10):
+                raise RuntimeError("timed out waiting to release first restore")
+
+    class ObservingImporter(BackupImporter):
+        def _recover_incomplete_restores(self) -> None:
+            second_recovery_entered.set()
+            super()._recover_incomplete_restores()
+
+    def run_first_restore() -> RestoreResult:
+        with Session(engine) as first_session:
+            user = first_session.get(User, first_user.id)
+            operation = first_session.get(
+                WorkspaceBackup, first_operation.id
+            )
+            assert user is not None
+            assert operation is not None
+            return PausingImporter(
+                session=first_session,
+                upload_root=restore_workspace["upload_root"],
+                temporary_directory=restore_workspace["temp_root"],
+                supported_app_versions={"0.1.0"},
+            ).restore(
+                restore_workspace["archive"],
+                user,
+                expected_workspace_owner_id=restore_workspace["archive_owner_id"],
+                operation=operation,
+                completed_at=datetime(
+                    2026, 7, 24, 14, 0, tzinfo=UTC
+                ),
+            )
+
+    def run_second_restore() -> RestoreResult:
+        with Session(engine) as second_session:
+            user = second_session.get(User, second_user.id)
+            operation = second_session.get(
+                WorkspaceBackup, second_operation.id
+            )
+            assert user is not None
+            assert operation is not None
+            return ObservingImporter(
+                session=second_session,
+                upload_root=restore_workspace["upload_root"],
+                temporary_directory=restore_workspace["temp_root"],
+                supported_app_versions={"0.1.0"},
+            ).restore(
+                second_archive,
+                user,
+                expected_workspace_owner_id=second_owner_id,
+                operation=operation,
+                completed_at=datetime(
+                    2026, 7, 24, 14, 0, tzinfo=UTC
+                ),
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(run_first_restore)
+        assert first_moved.wait(timeout=10)
+        journal = next(
+            restore_workspace["temp_root"].glob("restore-*/recovery-journal.json")
+        )
+        created_path = Path(
+            json.loads(journal.read_text(encoding="utf-8"))["created_paths"][0]
+        )
+        second = executor.submit(run_second_restore)
+        try:
+            assert not second_recovery_entered.wait(timeout=1)
+            assert journal.exists()
+            assert created_path.exists()
+        finally:
+            release_first.set()
+        first.result(timeout=10)
+        with pytest.raises(BackupRestoreFailed):
+            second.result(timeout=10)
+
+
 class CoordinatorImporter:
-    def __init__(self) -> None:
+    def __init__(self, session: Session) -> None:
+        self.session = session
         self.preview_owner_ids: list[UUID] = []
         self.restore_owner_ids: list[UUID] = []
         self.fail_restore = False
+        self.reject_commit_after_restore = False
 
     def preview(self, path: Path, expected_workspace_owner_id: UUID) -> BackupPreview:
         self.preview_owner_ids.append(expected_workspace_owner_id)
@@ -725,11 +995,30 @@ class CoordinatorImporter:
         )
 
     def restore(
-        self, path: Path, user: User, expected_workspace_owner_id: UUID
+        self,
+        path: Path,
+        user: User,
+        expected_workspace_owner_id: UUID,
+        *,
+        operation: WorkspaceBackup,
+        completed_at: datetime,
     ) -> RestoreResult:
         self.restore_owner_ids.append(expected_workspace_owner_id)
         if self.fail_restore:
             raise BackupRestoreFailed("injected restore failure")
+        operation.status = BackupStatus.completed
+        operation.completed_at = completed_at
+        operation.failure_message = None
+        operation.schema_version = 1
+        operation.archive_size_bytes = path.stat().st_size
+        operation.item_counts = {"notes": 1}
+        self.session.add(operation)
+        self.session.commit()
+        if self.reject_commit_after_restore:
+            def reject_commit(database_session: Session) -> None:
+                raise RuntimeError("coordinator attempted a second success commit")
+
+            event.listen(self.session, "before_commit", reject_commit, once=True)
         return RestoreResult(reprocessing_document_ids=[101])
 
 
@@ -794,10 +1083,31 @@ class CoordinatorStore:
         raise AssertionError("Restore safety backup must not run retention")
 
 
+class OAuthRefreshingCoordinatorStore(CoordinatorStore):
+    def __init__(
+        self,
+        source: StoredBackup,
+        archive: Path,
+        session: Session,
+        connection: GoogleDriveConnection,
+        refreshed_at: datetime,
+    ) -> None:
+        super().__init__(source, archive)
+        self.session = session
+        self.connection = connection
+        self.refreshed_at = refreshed_at
+
+    async def list(self, drive_owner_id: UUID) -> list[StoredBackup]:
+        self.connection.token_expires_at = self.refreshed_at
+        self.session.add(self.connection)
+        self.session.commit()
+        return await super().list(drive_owner_id)
+
+
 @pytest.fixture
 def coordinator_restore(
     session: Session, tmp_path: Path
-) -> dict[str, Any]:
+) -> Generator[dict[str, Any], None, None]:
     now = datetime(2026, 7, 24, 13, 0, tzinfo=UTC)
     user = User(email="coordinator-restore@example.com", hashed_password="hashed")
     other_user = User(email="other-coordinator@example.com", hashed_password="hashed")
@@ -855,11 +1165,12 @@ def coordinator_restore(
         completed=True,
     )
     store = CoordinatorStore(remote, archive)
-    importer = CoordinatorImporter()
+    importer = CoordinatorImporter(session)
     exporter = CoordinatorExporter(now)
+    lock_session = Session(engine)
     coordinator = BackupCoordinator(
         session_factory=lambda: session,
-        lock_session_factory=lambda: session,
+        lock_session_factory=lambda: lock_session,
         exporter_factory=lambda session: exporter,
         importer_factory=lambda session: importer,
         store_factory=lambda session, user, connection: store,
@@ -867,20 +1178,24 @@ def coordinator_restore(
         temporary_directory=tmp_path / "coordinator-temp",
         close_sessions=False,
     )
-    return {
-        "user": user,
-        "other_user": other_user,
-        "source": source,
-        "other_source": other_source,
-        "remote": remote,
-        "store": store,
-        "importer": importer,
-        "exporter": exporter,
-        "coordinator": coordinator,
-        "archive_owner_id": archive_owner_id,
-        "drive_owner_id": drive_owner_id,
-        "session": session,
-    }
+    try:
+        yield {
+            "user": user,
+            "other_user": other_user,
+            "source": source,
+            "other_source": other_source,
+            "connection": connection,
+            "remote": remote,
+            "store": store,
+            "importer": importer,
+            "exporter": exporter,
+            "coordinator": coordinator,
+            "archive_owner_id": archive_owner_id,
+            "drive_owner_id": drive_owner_id,
+            "session": session,
+        }
+    finally:
+        lock_session.close()
 
 
 @pytest.mark.asyncio
@@ -901,6 +1216,68 @@ async def test_preview_restore_uses_trusted_remote_workspace_owner(
     assert coordinator_restore["store"].listed_owner_ids == [
         coordinator_restore["drive_owner_id"]
     ]
+
+
+@pytest.mark.asyncio
+async def test_preview_allows_oauth_refresh_without_mutating_workspace_or_files(
+    coordinator_restore: dict[str, Any],
+    tmp_path: Path,
+) -> None:
+    session: Session = coordinator_restore["session"]
+    user: User = coordinator_restore["user"]
+    assert user.id is not None
+    existing_file = tmp_path / "preview-existing.txt"
+    existing_file.write_bytes(b"workspace bytes")
+    note = Notes(
+        user_id=user.id,
+        title="Preview sentinel",
+        content="must remain unchanged",
+    )
+    document = Document(
+        user_id=user.id,
+        title="Preview document",
+        file_name=existing_file.name,
+        file_path=str(existing_file),
+        file_size=existing_file.stat().st_size,
+        file_type="txt",
+        mime_type="text/plain",
+    )
+    settings_row = UserSettings(user_id=user.id, llm_model="preview-model")
+    session.add_all([note, document, settings_row])
+    session.commit()
+    before = _snapshot_workspace(session, user.id)
+    before_bytes = existing_file.read_bytes()
+    refreshed_at = datetime(2026, 7, 24, 18, 0, tzinfo=UTC)
+    store = OAuthRefreshingCoordinatorStore(
+        coordinator_restore["remote"],
+        coordinator_restore["store"].archive,
+        session,
+        coordinator_restore["connection"],
+        refreshed_at,
+    )
+    coordinator = BackupCoordinator(
+        session_factory=lambda: session,
+        importer_factory=lambda session: coordinator_restore[
+            "importer"
+        ],
+        store_factory=lambda session, user, connection: store,
+        temporary_directory=tmp_path / "preview-temp",
+        close_sessions=False,
+    )
+    source: WorkspaceBackup = coordinator_restore["source"]
+
+    preview = await coordinator.preview_restore(
+        user.id, source.backup_id
+    )
+
+    assert preview.schema_version == 1
+    session.refresh(coordinator_restore["connection"])
+    assert (
+        coordinator_restore["connection"].token_expires_at
+        == refreshed_at
+    )
+    assert _snapshot_workspace(session, user.id) == before
+    assert existing_file.read_bytes() == before_bytes
 
 
 @pytest.mark.asyncio
@@ -971,6 +1348,30 @@ async def test_restore_creates_verified_safety_backup_and_separate_operation(
 
 
 @pytest.mark.asyncio
+async def test_coordinator_does_not_commit_after_atomic_importer_success(
+    coordinator_restore: dict[str, Any],
+) -> None:
+    importer: CoordinatorImporter = coordinator_restore["importer"]
+    importer.reject_commit_after_restore = True
+    coordinator: BackupCoordinator = coordinator_restore["coordinator"]
+    source: WorkspaceBackup = coordinator_restore["source"]
+    user: User = coordinator_restore["user"]
+
+    response = await coordinator.restore(
+        user.id, source.backup_id, "RESTORE"  # type: ignore[arg-type]
+    )
+
+    assert response.status == BackupStatus.completed
+    restore_operation = coordinator_restore["session"].exec(
+        select(WorkspaceBackup).where(
+            WorkspaceBackup.user_id == user.id,
+            WorkspaceBackup.operation_kind == BackupOperationKind.restore,
+        )
+    ).one()
+    assert restore_operation.status == BackupStatus.completed
+
+
+@pytest.mark.asyncio
 async def test_restore_aborts_when_safety_backup_fails(
     coordinator_restore: dict[str, Any],
 ) -> None:
@@ -1010,6 +1411,115 @@ async def test_restore_failure_marks_only_restore_operation_failed(
     assert source.status == BackupStatus.completed
     assert restore_operation.status == BackupStatus.failed
     assert restore_operation.failure_message == "Workspace restore failed"
+
+
+@pytest.mark.asyncio
+async def test_restore_commit_failure_rolls_back_workspace_and_marks_operation_failed(
+    session: Session, restore_workspace: dict[str, Any]
+) -> None:
+    user: User = restore_workspace["user"]
+    assert user.id is not None
+    before = _snapshot_workspace(session, user.id)
+    now = datetime(2026, 7, 24, 15, 0, tzinfo=UTC)
+    connection = GoogleDriveConnection(
+        user_id=user.id,
+        encrypted_refresh_token=b"encrypted",
+        google_subject="commit-failure-subject",
+        google_email=user.email,
+        granted_scopes=["https://www.googleapis.com/auth/drive.appdata"],
+    )
+    schedule = BackupSchedule(user_id=user.id, enabled=True)
+    archive: Path = restore_workspace["archive"]
+    checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
+    source = WorkspaceBackup(
+        user_id=user.id,
+        status=BackupStatus.completed,
+        trigger=BackupTrigger.manual,
+        remote_file_id="commit-failure-source",
+        archive_size_bytes=archive.stat().st_size,
+        checksum=checksum,
+        schema_version=1,
+        completed_at=now,
+    )
+    session.add_all([connection, schedule, source])
+    session.commit()
+    remote = StoredBackup(
+        remote_id="commit-failure-source",
+        name=archive.name,
+        size=archive.stat().st_size,
+        created_at=now,
+        metadata=BackupObjectMetadata(
+            drive_owner_id=derive_drive_owner_id(
+                connection.google_subject
+            ),
+            workspace_owner_id=restore_workspace["archive_owner_id"],
+            backup_id=uuid4(),
+            schema_version=1,
+            archive_checksum=checksum,
+            created_at=now,
+        ),
+        completed=True,
+    )
+    store = CoordinatorStore(remote, archive)
+    commit_attempted = Event()
+
+    class CommitFailingImporter(BackupImporter):
+        def _insert_workspace(
+            self,
+            user_id: int,
+            validated: Any,
+            final_paths: Mapping[UUID, Path],
+        ) -> list[int]:
+            result = super()._insert_workspace(
+                user_id, validated, final_paths
+            )
+
+            def fail_commit(database_session: Session) -> None:
+                commit_attempted.set()
+                raise RuntimeError("injected atomic restore commit failure")
+
+            assert self.session is not None
+            event.listen(self.session, "before_commit", fail_commit, once=True)
+            return result
+
+    with Session(engine) as lock_session:
+        coordinator = BackupCoordinator(
+            session_factory=lambda: session,
+            lock_session_factory=lambda: lock_session,
+            exporter_factory=lambda session: CoordinatorExporter(
+                now
+            ),
+            importer_factory=lambda session: CommitFailingImporter(
+                session=session,
+                upload_root=restore_workspace["upload_root"],
+                temporary_directory=restore_workspace["temp_root"],
+                supported_app_versions={"0.1.0"},
+            ),
+            store_factory=lambda session, user, connection: store,
+            clock=lambda: now,
+            temporary_directory=restore_workspace["temp_root"]
+            / "coordinator",
+            close_sessions=False,
+        )
+
+        with pytest.raises(BackupRestoreFailed):
+            await coordinator.restore(
+                user.id, source.backup_id, "RESTORE"
+            )
+
+    assert commit_attempted.is_set()
+    assert _snapshot_workspace(session, user.id) == before
+    restore_operation = session.exec(
+        select(WorkspaceBackup).where(
+            WorkspaceBackup.user_id == user.id,
+            WorkspaceBackup.operation_kind == BackupOperationKind.restore,
+        )
+    ).one()
+    assert restore_operation.status == BackupStatus.failed
+    assert restore_operation.failure_message == "Workspace restore failed"
+    assert sorted(
+        path.name for path in restore_workspace["upload_root"].iterdir()
+    ) == ["old.txt", "other.txt"]
 
 
 @pytest.mark.asyncio

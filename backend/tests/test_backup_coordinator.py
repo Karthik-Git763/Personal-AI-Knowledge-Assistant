@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import text
 from sqlmodel import Session, col, select
 
+from app.core.database import engine
 from app.models.backup import (
     BackupSchedule,
     BackupStatus,
@@ -200,6 +201,7 @@ def _coordinator(
     configured_exporter = exporter or RecordingExporter(now, exporter_failure)
     return BackupCoordinator(
         session_factory=lambda: session,
+        lock_session_factory=lambda: Session(engine),
         exporter_factory=lambda session: configured_exporter,
         store_factory=lambda session, user, connection: store,
         clock=lambda: now,
