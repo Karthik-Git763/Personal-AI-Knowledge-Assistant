@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import jwt
+from cryptography.fernet import Fernet, InvalidToken
 from pwdlib import PasswordHash
 from pwdlib.hashers.argon2 import Argon2Hasher
 from pwdlib.hashers.bcrypt import BcryptHasher
@@ -18,6 +19,33 @@ password_hash = PasswordHash(
     )
 )
 ALGORITHM = "HS256"
+
+
+class ProviderTokenEncryptionError(RuntimeError):
+    """Raised when Google Drive token encryption cannot be safely performed."""
+
+
+def _provider_token_fernet() -> Fernet:
+    key = settings.GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY
+    if not key:
+        raise ProviderTokenEncryptionError("Google Drive token encryption is not configured")
+    try:
+        return Fernet(key.encode())
+    except (TypeError, ValueError) as error:
+        raise ProviderTokenEncryptionError("Google Drive token encryption configuration is invalid") from error
+
+
+def encrypt_provider_token(value: str) -> bytes:
+    """Encrypt a provider credential with the dedicated Google Drive key."""
+    return _provider_token_fernet().encrypt(value.encode())
+
+
+def decrypt_provider_token(value: bytes) -> str:
+    """Decrypt a provider credential without exposing ciphertext failures."""
+    try:
+        return _provider_token_fernet().decrypt(value).decode()
+    except (InvalidToken, UnicodeDecodeError) as error:
+        raise ProviderTokenEncryptionError("Google Drive provider token cannot be decrypted") from error
 
 
 def create_access_token(subject: str | Any, expires_delta: timedelta) -> str:

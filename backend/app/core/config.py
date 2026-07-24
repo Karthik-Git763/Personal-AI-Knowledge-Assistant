@@ -180,6 +180,36 @@ class Settings(BaseSettings):
     WEBSOCKET_MAX_MESSAGE_SIZE: int = 64 * 1024
     WEBSOCKET_MAX_CONTENT_LENGTH: int = 10_000
 
+    # Google Drive backups
+    GOOGLE_DRIVE_CLIENT_ID: str | None = None
+    GOOGLE_DRIVE_CLIENT_SECRET: str | None = None
+    GOOGLE_DRIVE_REDIRECT_URI: str = "http://localhost:3000/api/v1/users/me/google-drive/callback"
+    GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY: str | None = None
+    BACKUP_INTERVAL_HOURS: int = 24
+    BACKUP_RETENTION_COUNT: int = 5
+    BACKUP_MAX_ARCHIVE_SIZE: int = 1_073_741_824
+    BACKUP_TEMP_DIR: Path = Path("./backup-temp")
+
+    @computed_field
+    @property
+    def google_drive_backup_enabled(self) -> bool:
+        return bool(
+            self.GOOGLE_DRIVE_CLIENT_ID
+            and self.GOOGLE_DRIVE_CLIENT_SECRET
+            and self.GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY
+        )
+
+    @model_validator(mode="after")
+    def _validate_google_drive_backup_configuration(self) -> Self:
+        configured_values = (
+            self.GOOGLE_DRIVE_CLIENT_ID,
+            self.GOOGLE_DRIVE_CLIENT_SECRET,
+            self.GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY,
+        )
+        if self.ENVIRONMENT == "production" and any(configured_values) and not all(configured_values):
+            raise ValueError("Google Drive backup configuration is incomplete in production")
+        return self
+
     # Database SSL
     # SSL modes: disable, allow, prefer, require, verify-ca, verify-full
     # Production MUST use: require, verify-ca, or verify-full
