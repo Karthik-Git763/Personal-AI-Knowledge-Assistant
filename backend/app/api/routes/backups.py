@@ -35,7 +35,11 @@ from app.schemas.backup import (
 )
 from app.schemas.error import ErrorCode
 from app.services.backup_coordinator import BackupCoordinator, BackupPreconditionError
-from app.services.backup_store import StoredBackup, is_valid_stored_backup
+from app.services.backup_store import (
+    StoredBackup,
+    is_trusted_stored_backup,
+    is_valid_stored_backup,
+)
 from app.services.google_drive_oauth import (
     GoogleDriveOAuthError,
     GoogleDriveOAuthReauthorizationRequiredError,
@@ -51,6 +55,7 @@ from app.services.google_drive_store import (
 )
 
 router = APIRouter(prefix="/users/me", tags=["backups"])
+_SUPPORTED_RESTORE_SCHEMA_VERSIONS = {1}
 
 
 class BackupApiErrorCode(StrEnum):
@@ -79,7 +84,9 @@ def _current_user_id(current_user: User) -> int:
     return current_user.id
 
 
-def _operation_response(backup: WorkspaceBackup) -> WorkspaceBackupResponse:
+def _operation_response(
+    backup: WorkspaceBackup, *, restore_eligible: bool = False
+) -> WorkspaceBackupResponse:
     return WorkspaceBackupResponse(
         backup_id=backup.backup_id,
         operation_kind=backup.operation_kind,
@@ -92,6 +99,7 @@ def _operation_response(backup: WorkspaceBackup) -> WorkspaceBackupResponse:
         started_at=backup.started_at,
         completed_at=backup.completed_at,
         failure_message=backup.failure_message,
+        restore_eligible=restore_eligible,
     )
 
 
@@ -123,6 +131,12 @@ def _not_found() -> AppError:
 
 
 def _map_drive_error(error: Exception) -> AppError:
+    if isinstance(error, BackupPreconditionError):
+        return AppError(
+            "Backup prerequisites are unavailable.",
+            ErrorCode.CONFLICT,
+            status.HTTP_409_CONFLICT,
+        )
     if isinstance(
         error,
         GoogleDriveReauthorizationRequiredError | GoogleDriveOAuthReauthorizationRequiredError,
@@ -176,6 +190,18 @@ def _matching_local_backup(
             WorkspaceBackup.operation_kind == BackupOperationKind.snapshot,
         )
     ).one_or_none()
+
+
+def _restore_eligible(backup: WorkspaceBackup, remote: StoredBackup) -> bool:
+    return (
+        backup.operation_kind == BackupOperationKind.snapshot
+        and backup.status == BackupStatus.completed
+        and backup.schema_version in _SUPPORTED_RESTORE_SCHEMA_VERSIONS
+        and remote.completed
+        and remote.metadata.schema_version == backup.schema_version
+        and remote.metadata.archive_checksum == backup.checksum
+        and remote.size == backup.archive_size_bytes
+    )
 
 
 def _active_operation(session: SessionDep, user_id: int) -> WorkspaceBackup | None:
@@ -289,7 +315,7 @@ async def google_drive_status(
                         schema_version=remote.metadata.schema_version,
                         archive_size_bytes=remote.size,
                         created_at=remote.metadata.created_at,
-                        restore_eligible=True,
+                        restore_eligible=_restore_eligible(local, remote),
                     )
                 )
 
@@ -328,8 +354,9 @@ async def delete_google_drive_backups(
     try:
         owner_id = derive_drive_owner_id(connection.google_subject)
         backups = await store.list(owner_id)
-        trusted = [backup for backup in backups if is_valid_stored_backup(backup, owner_id)]
+        trusted = [backup for backup in backups if is_trusted_stored_backup(backup, owner_id)]
         for backup in trusted:
+            store.authorize_backup(backup)
             await store.delete(backup.remote_id)
     except Exception as error:
         raise _map_drive_error(error) from error
@@ -346,7 +373,7 @@ def create_backup(
     _connection(session, _current_user_id(current_user))
     coordinator = BackupCoordinator()
     try:
-        operation = coordinator.start_backup(_current_user_id(current_user), BackupTrigger.manual)
+        operation = coordinator.start_manual_backup(_current_user_id(current_user))
     except BackupPreconditionError as error:
         raise _error(
             "A backup operation is already active.",
@@ -375,7 +402,10 @@ async def list_backups(session: SessionDep, current_user: CurrentUser) -> list[W
         if backup.remote_file_id is not None
     }
     return [
-        _operation_response(local_by_remote[remote.remote_id])
+        _operation_response(
+            local_by_remote[remote.remote_id],
+            restore_eligible=_restore_eligible(local_by_remote[remote.remote_id], remote),
+        )
         for remote in sorted(remote_backups, key=lambda backup: backup.created_at, reverse=True)
         if remote.remote_id in local_by_remote
     ]
@@ -397,6 +427,7 @@ async def preview_backup(
     ).one_or_none()
     if source is None:
         raise _not_found()
+    _connection(session, user_id)
     try:
         preview = await BackupCoordinator().preview_restore(user_id, backup_id)
     except Exception as error:

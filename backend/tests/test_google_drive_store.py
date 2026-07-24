@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -587,3 +588,27 @@ async def test_delete_accepts_only_locally_validated_backup_identity(
         await store.delete(REMOTE_ID)
     finally:
         await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_delete_authorizes_trusted_incomplete_cognolith_backup(
+    session: Session, configured_token_encryption: Settings
+) -> None:
+    deleted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url == GoogleDriveOAuthService.TOKEN_URL:
+            return _token_response(request)
+        assert request.method == "DELETE"
+        deleted.append(request.url.path.rsplit("/", maxsplit=1)[-1])
+        return httpx.Response(204)
+
+    store, owner_id = await _store(session, configured_token_encryption, handler)
+    incomplete = replace(_stored_backup(_metadata(owner_id)), completed=False)
+    try:
+        store.authorize_backup(incomplete)
+        await store.delete(incomplete.remote_id)
+    finally:
+        await store.aclose()
+
+    assert deleted == [incomplete.remote_id]

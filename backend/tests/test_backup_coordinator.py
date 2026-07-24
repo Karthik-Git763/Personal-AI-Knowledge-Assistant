@@ -20,7 +20,7 @@ from app.models.backup import (
 )
 from app.models.user import User
 from app.services.backup_archive import BackupExportResult, BackupManifestV1
-from app.services.backup_coordinator import BackupCoordinator
+from app.services.backup_coordinator import BackupCoordinator, BackupPreconditionError
 from app.services.backup_store import BackupObjectMetadata, StoredBackup
 from app.services.google_drive_oauth import derive_drive_owner_id
 from app.services.google_drive_store import GoogleDriveReauthorizationRequiredError
@@ -363,6 +363,22 @@ def test_duplicate_trigger_returns_pending_operation(
         )
         == 1
     )
+
+
+def test_manual_trigger_rejects_an_active_operation(
+    session: Session, tmp_path: Path, backup_workspace: tuple[User, GoogleDriveConnection, BackupSchedule]
+) -> None:
+    user, _, _ = backup_workspace
+    coordinator = _coordinator(
+        session,
+        tmp_path,
+        datetime(2026, 7, 24, 13, 0, tzinfo=UTC),
+        RecordingStore(),
+    )
+    coordinator.start_backup(user.id, BackupTrigger.scheduled)  # type: ignore[arg-type]
+
+    with pytest.raises(BackupPreconditionError, match="already active"):
+        coordinator.start_manual_backup(user.id)  # type: ignore[attr-defined,arg-type]
 
 
 @pytest.mark.asyncio

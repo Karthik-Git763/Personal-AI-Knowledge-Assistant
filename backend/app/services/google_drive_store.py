@@ -19,7 +19,7 @@ from app.models.backup import BackupStatus, GoogleDriveConnection, WorkspaceBack
 from app.services.backup_store import (
     BackupObjectMetadata,
     StoredBackup,
-    is_valid_stored_backup,
+    is_trusted_stored_backup,
 )
 from app.services.google_drive_oauth import (
     GoogleDriveOAuthError,
@@ -211,7 +211,7 @@ class GoogleDriveStore:
     def authorize_backup(self, backup: StoredBackup | WorkspaceBackup) -> None:
         """Allow an ID from a validated stored backup or completed local backup record."""
         if isinstance(backup, StoredBackup):
-            if not is_valid_stored_backup(backup, self.drive_owner_id):
+            if not is_trusted_stored_backup(backup, self.drive_owner_id):
                 raise ValueError("Stored backup is not valid for this owner")
             remote_id = backup.remote_id
         elif isinstance(backup, WorkspaceBackup):

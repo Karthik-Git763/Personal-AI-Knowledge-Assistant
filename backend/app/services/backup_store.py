@@ -50,10 +50,17 @@ _CHECKSUM = re.compile(r"[0-9a-f]{64}")
 
 
 def is_valid_stored_backup(backup: StoredBackup, drive_owner_id: UUID) -> bool:
+    return (
+        is_trusted_stored_backup(backup, drive_owner_id)
+        and backup.completed
+    )
+
+
+def is_trusted_stored_backup(backup: StoredBackup, drive_owner_id: UUID) -> bool:
+    """Return whether a listed Cognolith object is safe to authorize for deletion."""
     metadata = backup.metadata
     return (
-        backup.completed
-        and metadata.drive_owner_id == drive_owner_id
+        metadata.drive_owner_id == drive_owner_id
         and bool(backup.remote_id)
         and bool(backup.name)
         and backup.size >= 0

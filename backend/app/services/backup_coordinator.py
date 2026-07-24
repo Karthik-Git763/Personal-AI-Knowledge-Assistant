@@ -122,12 +122,21 @@ class BackupCoordinator:
 
     def start_backup(self, user_id: int, trigger: BackupTrigger) -> WorkspaceBackup:
         """Create a durable pending operation, collapsing an active user operation."""
+        return self._start_backup(user_id, trigger, collapse_active=True)
+
+    def start_manual_backup(self, user_id: int) -> WorkspaceBackup:
+        """Create a manual backup or reject it when any operation is active."""
+        return self._start_backup(user_id, BackupTrigger.manual, collapse_active=False)
+
+    def _start_backup(
+        self, user_id: int, trigger: BackupTrigger, *, collapse_active: bool
+    ) -> WorkspaceBackup:
         with self._session() as session:
             if not self._try_transaction_lock(session, user_id):
                 session.rollback()
                 active = self._active_backup(session, user_id)
-                if active is None:
-                    raise BackupPreconditionError("Backup operation is busy")
+                if active is None or not collapse_active:
+                    raise BackupPreconditionError("Backup operation already active")
                 return self._detach(session, active)
 
             if session.get(User, user_id) is None:
@@ -136,9 +145,9 @@ class BackupCoordinator:
 
             active = self._active_backup(session, user_id)
             if active is not None:
-                if active.operation_kind != BackupOperationKind.snapshot:
+                if not collapse_active or active.operation_kind != BackupOperationKind.snapshot:
                     session.rollback()
-                    raise BackupPreconditionError("Backup operation is busy")
+                    raise BackupPreconditionError("Backup operation already active")
                 session.commit()
                 return self._detach(session, active)
 

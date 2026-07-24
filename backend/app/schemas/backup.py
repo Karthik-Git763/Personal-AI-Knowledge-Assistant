@@ -36,6 +36,7 @@ class WorkspaceBackupResponse(BaseModel):
     started_at: datetime | None = None
     completed_at: datetime | None = None
     failure_message: str | None = None
+    restore_eligible: bool = False
 
 
 class RestorePreviewResponse(BaseModel):
