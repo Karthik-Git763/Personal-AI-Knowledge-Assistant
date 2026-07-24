@@ -44,5 +44,5 @@ class RestoreConfirmationRequest(BaseModel):
 
 
 class BackupOperationStatusResponse(BaseModel):
-    status: Literal["accepted", "completed", "failed"]
+    status: BackupStatus
     backup_id: UUID | None = None

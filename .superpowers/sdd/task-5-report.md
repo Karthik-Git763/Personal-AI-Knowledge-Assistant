@@ -54,3 +54,24 @@ Self-review:
 
 Concerns:
 - No remaining known Critical/Important concerns in the Task 5 remediation scope.
+
+## Operation Status Schema Remediation
+
+Status: complete
+
+Files:
+- `backend/app/schemas/backup.py`
+- `backend/tests/test_backup_models.py`
+- `.superpowers/sdd/task-5-report.md`
+
+RED/GREEN evidence:
+- RED: `docker compose exec backend pytest -q tests/test_backup_models.py::test_backup_operation_status_schema_uses_all_persisted_statuses` failed because `BackupOperationStatusResponse.status` was the stale `Literal["accepted", "completed", "failed"]` rather than `BackupStatus`.
+- GREEN: `docker compose exec backend pytest -q tests/test_backup_models.py tests/test_backup_coordinator.py` completed with `23 passed in 41.12s`.
+- Static checks: focused Ruff completed with `All checks passed!`; BasedPyright completed with `0 errors, 0 warnings, 0 notes`.
+
+Self-review:
+- Confirmed `BackupOperationStatusResponse.status` is typed as `BackupStatus` and accepts every currently persisted status: `pending`, `exporting`, `uploading`, `completed`, and `failed`.
+- Confirmed no migration was added or changed; unreleased migration `0005` remains the sole migration exposed to `main`.
+
+Concerns:
+- No remaining known concerns in this remediation scope.

@@ -16,6 +16,7 @@ from app.models.chat import ChatMessages, ChatRole, ChatSession
 from app.models.document import Document
 from app.models.note import NoteCategory, NoteFolders, NoteLinks, Notes, NoteTags, NoteTemplates
 from app.models.user import User
+from app.schemas.backup import BackupOperationStatusResponse
 
 
 def test_portable_ids_are_generated_and_distinct() -> None:
@@ -67,6 +68,13 @@ def test_backup_enums_use_persisted_values() -> None:
         "reauthorization_required",
         "failed",
     ]
+
+
+def test_backup_operation_status_schema_uses_all_persisted_statuses() -> None:
+    assert BackupOperationStatusResponse.model_fields["status"].annotation is BackupStatus
+    assert {
+        BackupOperationStatusResponse(status=status).status for status in BackupStatus
+    } == set(BackupStatus)
 
 
 def test_backup_defaults_to_pending_manual_snapshot() -> None:
