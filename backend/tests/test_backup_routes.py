@@ -1,0 +1,295 @@
+import hashlib
+from datetime import UTC, datetime, timedelta
+from uuid import uuid4
+
+from fastapi.testclient import TestClient
+from sqlmodel import select
+
+from app.api.deps import get_current_user
+from app.core.config import settings
+from app.main import app
+from app.models.backup import (
+    BackupSchedule,
+    BackupStatus,
+    DriveConnectionStatus,
+    GoogleDriveConnection,
+    OAuthState,
+    WorkspaceBackup,
+)
+from app.models.user import User
+from app.services.backup_coordinator import BackupCoordinator
+from app.services.google_drive_oauth import GoogleDriveOAuthService
+
+
+def _authenticated_client(session) -> tuple[TestClient, User]:
+    user = User(
+        email="backup-routes@example.com",
+        hashed_password="hashed-password",
+        is_verified=True,
+    )
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    assert user.id is not None
+
+    def current_user() -> User:
+        return user
+
+    app.dependency_overrides[get_current_user] = current_user
+    client = TestClient(app)
+    csrf_token = "a" * 32
+    client.cookies.set("csrf-token", csrf_token)
+    client.headers.update({"X-CSRF-Token": csrf_token})
+    return client, user
+
+
+def _configure_drive(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "GOOGLE_DRIVE_CLIENT_ID", "client-id")
+    monkeypatch.setattr(settings, "GOOGLE_DRIVE_CLIENT_SECRET", "client-secret")
+    monkeypatch.setattr(settings, "GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY", "token-key")
+
+
+def _connection(session, user: User) -> GoogleDriveConnection:
+    assert user.id is not None
+    connection = GoogleDriveConnection(
+        user_id=user.id,
+        encrypted_refresh_token=b"encrypted-token",
+        google_subject="google-subject",
+        google_email=user.email,
+    )
+    session.add(connection)
+    session.commit()
+    return connection
+
+
+def test_backup_routes_require_authentication() -> None:
+    client = TestClient(app)
+
+    assert client.get("/api/v1/users/me/backups").status_code == 401
+
+
+def test_manual_backup_returns_pending_operation(session, monkeypatch) -> None:
+    client, user = _authenticated_client(session)
+    _connection(session, user)
+    _configure_drive(monkeypatch)
+
+    async def run_backup(*_: object) -> None:
+        return None
+
+    monkeypatch.setattr(BackupCoordinator, "run_backup", run_backup)
+
+    try:
+        response = client.post("/api/v1/users/me/backups")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "pending"
+
+
+def test_backup_routes_apply_csrf_protection(session) -> None:
+    client, _ = _authenticated_client(session)
+    client.cookies.clear()
+    client.headers.clear()
+
+    try:
+        response = client.post("/api/v1/users/me/backups")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 403
+
+
+def test_status_reports_unconfigured_deployment(session) -> None:
+    client, _ = _authenticated_client(session)
+
+    try:
+        response = client.get("/api/v1/users/me/google-drive/status")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "GOOGLE_DRIVE_NOT_CONFIGURED"
+
+
+def test_restore_requires_exact_confirmation(session) -> None:
+    client, _ = _authenticated_client(session)
+
+    try:
+        response = client.post(
+            f"/api/v1/users/me/backups/{uuid4()}/restore",
+            json={"confirmation": "yes"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 422
+
+
+def test_operation_is_scoped_to_current_user(session) -> None:
+    client, user = _authenticated_client(session)
+    foreign = User(email="foreign@example.com", hashed_password="hashed-password", is_verified=True)
+    session.add(foreign)
+    session.commit()
+    assert foreign.id is not None
+    operation = WorkspaceBackup(user_id=foreign.id, status=BackupStatus.pending)
+    session.add(operation)
+    session.commit()
+
+    try:
+        response = client.get(f"/api/v1/users/me/backups/operations/{operation.backup_id}")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert user.id != foreign.id
+    assert response.status_code == 404
+
+
+def test_status_redacts_provider_credentials(session, monkeypatch) -> None:
+    client, user = _authenticated_client(session)
+    assert user.id is not None
+    connection = _connection(session, user)
+    _configure_drive(monkeypatch)
+
+    async def no_backups(*_: object) -> list[object]:
+        return []
+
+    monkeypatch.setattr("app.api.routes.backups._trusted_remote_backups", no_backups)
+    try:
+        response = client.get("/api/v1/users/me/google-drive/status")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert "encrypted_refresh_token" not in response.text
+    assert connection.google_subject not in response.text
+
+
+def test_overdue_status_requests_collapse_to_one_operation(session, monkeypatch) -> None:
+    client, user = _authenticated_client(session)
+    assert user.id is not None
+    _connection(session, user)
+    _configure_drive(monkeypatch)
+    schedule = BackupSchedule(
+        user_id=user.id,
+        enabled=True,
+        next_due_at=datetime.now(UTC) - timedelta(minutes=1),
+    )
+    session.add(schedule)
+    session.commit()
+
+    async def no_backups(*_: object) -> list[object]:
+        return []
+
+    async def run_backup(*_: object) -> None:
+        return None
+
+    monkeypatch.setattr("app.api.routes.backups._trusted_remote_backups", no_backups)
+    monkeypatch.setattr(BackupCoordinator, "run_backup", run_backup)
+    try:
+        first = client.get("/api/v1/users/me/google-drive/status")
+        second = client.get("/api/v1/users/me/google-drive/status")
+    finally:
+        app.dependency_overrides.clear()
+
+    operations = session.exec(
+        select(WorkspaceBackup).where(WorkspaceBackup.user_id == user.id)
+    ).all()
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert len(operations) == 1
+
+
+def test_callback_uses_state_binding_and_rejects_replay(session, monkeypatch) -> None:
+    client, user = _authenticated_client(session)
+    assert user.id is not None
+    _configure_drive(monkeypatch)
+    raw_state = "state-value"
+    session.add(
+        OAuthState(
+            user_id=user.id,
+            state_hash=hashlib.sha256(raw_state.encode()).hexdigest(),
+            expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
+    )
+    session.commit()
+
+    async def complete_authorization(self, user_id: int, state: str, code: str):
+        self.consume_state(user_id, state)
+        return object()
+
+    monkeypatch.setattr(GoogleDriveOAuthService, "complete_authorization", complete_authorization)
+    try:
+        first = client.get(
+            "/api/v1/users/me/google-drive/callback",
+            params={"state": raw_state, "code": "authorization-code"},
+            follow_redirects=False,
+        )
+        replay = client.get(
+            "/api/v1/users/me/google-drive/callback",
+            params={"state": raw_state, "code": "authorization-code"},
+            follow_redirects=False,
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert first.headers["location"].endswith("/settings?drive=connected")
+    assert replay.headers["location"].endswith("/settings?drive=invalid_state")
+
+
+def test_callback_never_redirects_to_provider_query_value(session, monkeypatch) -> None:
+    client, _ = _authenticated_client(session)
+    _configure_drive(monkeypatch)
+    try:
+        response = client.get(
+            "/api/v1/users/me/google-drive/callback",
+            params={"state": "unknown", "code": "code", "error": "https://evil.example"},
+            follow_redirects=False,
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.headers["location"].endswith("/settings?drive=invalid_state")
+    assert "evil.example" not in response.headers["location"]
+
+
+def test_reauthorization_status_is_visible_without_provider_call(session, monkeypatch) -> None:
+    client, user = _authenticated_client(session)
+    connection = _connection(session, user)
+    connection.status = DriveConnectionStatus.reauthorization_required
+    session.add(connection)
+    session.commit()
+    _configure_drive(monkeypatch)
+    try:
+        response = client.get("/api/v1/users/me/google-drive/status")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    assert response.json()["connection_status"] == "reauthorization_required"
+
+
+def test_restore_hides_foreign_backup_existence(session, monkeypatch) -> None:
+    client, _ = _authenticated_client(session)
+    foreign = User(email="restore-foreign@example.com", hashed_password="hashed-password", is_verified=True)
+    session.add(foreign)
+    session.commit()
+    assert foreign.id is not None
+    source = WorkspaceBackup(
+        user_id=foreign.id,
+        status=BackupStatus.completed,
+        remote_file_id="remote-file-id",
+        checksum="a" * 64,
+    )
+    session.add(source)
+    session.commit()
+    _configure_drive(monkeypatch)
+    try:
+        response = client.post(
+            f"/api/v1/users/me/backups/{source.backup_id}/restore",
+            json={"confirmation": "RESTORE"},
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 404

@@ -59,10 +59,34 @@ class RestoreResult(BaseModel):
 
 
 class RestoreConfirmationRequest(BaseModel):
-    backup_id: UUID
     confirmation: Literal["RESTORE"]
 
 
 class BackupOperationStatusResponse(BaseModel):
     status: BackupStatus
     backup_id: UUID | None = None
+
+
+class DeleteBackupsConfirmationRequest(BaseModel):
+    confirmation: Literal["DELETE BACKUPS"]
+
+
+class RestorePointSummary(BaseModel):
+    backup_id: UUID
+    schema_version: int
+    archive_size_bytes: int
+    created_at: datetime
+    restore_eligible: bool
+
+
+class GoogleDriveBackupStatusResponse(BaseModel):
+    configured: bool
+    enabled: bool
+    connection_status: DriveConnectionStatus | None = None
+    google_email: str | None = None
+    last_attempt_at: datetime | None = None
+    last_success_at: datetime | None = None
+    next_due_at: datetime | None = None
+    consecutive_failures: int = 0
+    active_operation: WorkspaceBackupResponse | None = None
+    restore_points: list[RestorePointSummary] = Field(default_factory=list)

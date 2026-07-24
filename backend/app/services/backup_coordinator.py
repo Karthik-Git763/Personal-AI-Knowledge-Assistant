@@ -206,35 +206,83 @@ class BackupCoordinator:
                 shutil.rmtree(temporary_path, ignore_errors=True)
             await self._close_store(store)
 
-    async def restore(
+    def start_restore(
         self, user_id: int, backup_id: UUID, confirmation: str
-    ) -> BackupOperationStatusResponse:
+    ) -> WorkspaceBackup:
+        """Persist a restore operation before background execution begins."""
         if confirmation != "RESTORE":
             raise BackupPreconditionError("Exact restore confirmation is required")
 
+        with self._session() as session:
+            if not self._try_transaction_lock(session, user_id):
+                session.rollback()
+                raise BackupPreconditionError("Backup operation is busy")
+            if self._active_backup(session, user_id) is not None:
+                session.rollback()
+                raise BackupPreconditionError("Backup operation is busy")
+            _, _, source = self._restore_requirements(session, user_id, backup_id)
+            restore_operation = WorkspaceBackup(
+                user_id=user_id,
+                operation_kind=BackupOperationKind.restore,
+                source_backup_id=source.backup_id,
+                status=BackupStatus.pending,
+                trigger=BackupTrigger.manual,
+                started_at=self.clock(),
+            )
+            session.add(restore_operation)
+            session.commit()
+            return self._detach(session, restore_operation)
+
+    async def restore(
+        self, user_id: int, backup_id: UUID, confirmation: str
+    ) -> BackupOperationStatusResponse:
+        operation = self.start_restore(user_id, backup_id, confirmation)
+        if operation.backup_id is None:
+            raise RuntimeError("Restore operation was not persisted")
+        return await self.run_restore(operation.backup_id)
+
+    async def run_restore(
+        self, restore_backup_id: UUID
+    ) -> BackupOperationStatusResponse:
+        """Run an existing restore operation while preserving restore safeguards."""
+
         restore_operation_id: int | None = None
+        locked_user_id: int | None = None
         temporary_path: Path | None = None
         store: BackupStore | None = None
         with self._session(self.lock_session_factory) as lock_session:
-            if not self._try_session_lock(lock_session, user_id):
-                raise BackupPreconditionError("Backup operation is busy")
             try:
                 with self._session() as session:
                     try:
-                        user, connection, source = self._restore_requirements(
-                            session, user_id, backup_id
-                        )
-                        restore_operation = WorkspaceBackup(
-                            user_id=user_id,
-                            operation_kind=BackupOperationKind.restore,
-                            source_backup_id=source.backup_id,
-                            status=BackupStatus.pending,
-                            trigger=BackupTrigger.manual,
-                            started_at=self.clock(),
-                        )
-                        session.add(restore_operation)
-                        session.commit()
+                        restore_operation = session.exec(
+                            select(WorkspaceBackup).where(
+                                WorkspaceBackup.backup_id == restore_backup_id
+                            )
+                        ).one_or_none()
+                        if (
+                            restore_operation is None
+                            or restore_operation.operation_kind
+                            != BackupOperationKind.restore
+                        ):
+                            raise BackupPreconditionError("Restore operation is unavailable")
+                        if restore_operation.status in {
+                            BackupStatus.completed,
+                            BackupStatus.failed,
+                        }:
+                            return BackupOperationStatusResponse(
+                                status=restore_operation.status,
+                                backup_id=restore_operation.backup_id,
+                            )
+                        user_id = restore_operation.user_id
                         restore_operation_id = restore_operation.id
+                        if not self._try_session_lock(lock_session, user_id):
+                            raise BackupPreconditionError("Backup operation is busy")
+                        locked_user_id = user_id
+                        if restore_operation.source_backup_id is None:
+                            raise BackupPreconditionError("Restore source is unavailable")
+                        user, connection, source = self._restore_requirements(
+                            session, user_id, restore_operation.source_backup_id
+                        )
 
                         drive_owner_id = derive_drive_owner_id(
                             connection.google_subject
@@ -308,7 +356,8 @@ class BackupCoordinator:
                             )
                         await self._close_store(store)
             finally:
-                self._release_session_lock(lock_session, user_id)
+                if locked_user_id is not None:
+                    self._release_session_lock(lock_session, locked_user_id)
 
     async def _run_locked(
         self,
