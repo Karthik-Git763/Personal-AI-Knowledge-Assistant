@@ -1,5 +1,6 @@
-from uuid import UUID
+from uuid import UUID, uuid4
 
+import pytest
 from sqlmodel import SQLModel
 
 from app.models.backup import (
@@ -14,6 +15,7 @@ from app.models.backup import (
 from app.models.chat import ChatMessages, ChatRole, ChatSession
 from app.models.document import Document
 from app.models.note import NoteFolders, NoteLinks, Notes, NoteTags
+from app.models.user import User
 
 
 def test_portable_ids_are_generated_and_distinct() -> None:
@@ -63,10 +65,16 @@ def test_backup_defaults_to_pending_manual_snapshot() -> None:
     assert backup.item_counts == {}
 
 
-def test_backup_failure_message_is_sanitized() -> None:
+def test_backup_failure_message_is_sanitized_on_construction_and_update() -> None:
     backup = WorkspaceBackup(user_id=1, failure_message=" <b>Backup failed</b>\nagain ")
 
     assert backup.failure_message == "Backup failed again"
+
+    backup.failure_message = " <script>ignore</script> Update failed "
+    assert backup.failure_message == "ignore Update failed"
+
+    backup.sqlmodel_update({"failure_message": " <i>Retry</i>\nlater "})
+    assert backup.failure_message == "Retry later"
 
 
 def test_backup_schedule_defaults_to_daily_enabled() -> None:
@@ -83,3 +91,51 @@ def test_backup_tables_are_registered() -> None:
         WorkspaceBackup.__tablename__,
         BackupSchedule.__tablename__,
     }.issubset(SQLModel.metadata.tables)
+
+
+def test_portable_ids_are_immutable_after_persistence(session) -> None:
+    user = User(email="portable@example.com", hashed_password="hashed-password")
+    folder = NoteFolders(user_id=1, name="Folder", portable_id=uuid4())
+    tag = NoteTags(user_id=1, name="Tag", portable_id=uuid4())
+    document = Document(
+        user_id=1,
+        title="Document",
+        file_name="document.txt",
+        file_path="uploads/document.txt",
+        file_size=1,
+        file_type="txt",
+        mime_type="text/plain",
+        portable_id=uuid4(),
+    )
+    chat_session = ChatSession(user_id=1, portable_id=uuid4())
+    first_note = Notes(user_id=1, title="One", content="", portable_id=uuid4())
+    second_note = Notes(user_id=1, title="Two", content="", portable_id=uuid4())
+
+    session.add(user)
+    session.flush()
+    session.add_all([folder, tag, document, chat_session, first_note, second_note])
+    session.flush()
+
+    note_link = NoteLinks(
+        source_note_id=first_note.id,
+        target_note_id=second_note.id,
+        portable_id=uuid4(),
+    )
+    chat_message = ChatMessages(
+        session_id=chat_session.id,
+        role=ChatRole.user,
+        content="Hello",
+        portable_id=uuid4(),
+    )
+    session.add_all([note_link, chat_message])
+    session.commit()
+
+    models = [folder, tag, document, chat_session, first_note, second_note, note_link, chat_message]
+    original_ids = {id(model): model.portable_id for model in models}
+
+    for model in models:
+        assert model.portable_id == original_ids[id(model)]
+        with pytest.raises(ValueError, match="portable_id is immutable"):
+            model.portable_id = uuid4()
+        with pytest.raises(ValueError, match="portable_id is immutable"):
+            model.sqlmodel_update({"portable_id": uuid4()})

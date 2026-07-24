@@ -9,6 +9,8 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlmodel import Column, Field, Index, Relationship, SQLModel, String
 
+from .portable import PortableIdMixin
+
 if TYPE_CHECKING:
     from .note import Notes
     from .user import User
@@ -22,7 +24,7 @@ class TimestampMixin(SQLModel):
     )
 
 
-class ChatSession(TimestampMixin, SQLModel, table=True):
+class ChatSession(PortableIdMixin, TimestampMixin, SQLModel, table=True):
     __tablename__: ClassVar[str] = "chat_sessions"  # pyright: ignore
     __table_args__ = (
         Index("ix_chat_session_user_last_message", "user_id", desc("last_message_at")),
@@ -67,7 +69,7 @@ class ChatGenerationStatus(StrEnum):
     failed = "failed"
 
 
-class ChatMessages(TimestampMixin, SQLModel, table=True):
+class ChatMessages(PortableIdMixin, TimestampMixin, SQLModel, table=True):
     __tablename__: ClassVar[str] = "chat_messages"  # pyright: ignore
     __table_args__ = (Index("ix_chat_messages_session_created", "session_id", desc("created_at")),)
     model_config = ConfigDict(protected_namespaces=())  # pyright: ignore[reportAssignmentType]

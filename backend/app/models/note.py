@@ -19,6 +19,7 @@ from sqlmodel import (
 )
 
 from .chat import TimestampMixin
+from .portable import PortableIdMixin
 
 if TYPE_CHECKING:
     from .chat import ChatSession
@@ -26,7 +27,7 @@ if TYPE_CHECKING:
     from .user import User, UserSettings
 
 
-class NoteFolders(TimestampMixin, SQLModel, table=True):
+class NoteFolders(PortableIdMixin, TimestampMixin, SQLModel, table=True):
     __tablename__: ClassVar[str] = "note_folders"  # pyright: ignore
     __table_args__ = (
         UniqueConstraint(
@@ -79,7 +80,7 @@ class NoteTagRelations(SQLModel, table=True):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
-class Notes(TimestampMixin, SQLModel, table=True):
+class Notes(PortableIdMixin, TimestampMixin, SQLModel, table=True):
     __tablename__: ClassVar[str] = "notes"  # pyright: ignore[reportIncompatibleVariableOverride]
     __table_args__ = (
         Index(
@@ -205,7 +206,7 @@ class Notes(TimestampMixin, SQLModel, table=True):
     )
 
 
-class NoteTags(SQLModel, table=True):
+class NoteTags(PortableIdMixin, SQLModel, table=True):
     __tablename__: ClassVar[str] = "note_tags"  # pyright: ignore
     __table_args__ = (
         Index("ix_note_tags_user_name", "user_id", "name", unique=True),
@@ -282,7 +283,7 @@ class NoteLinkType(StrEnum):
     child = "child"
 
 
-class NoteLinks(SQLModel, table=True):
+class NoteLinks(PortableIdMixin, SQLModel, table=True):
     __tablename__: ClassVar[str] = "note_links"  # pyright: ignore
     __table_args__ = (
         CheckConstraint("source_note_id != target_note_id", name="check_note_links"),

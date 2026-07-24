@@ -8,6 +8,7 @@ from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlmodel import Column, Field, Index, Relationship, SQLModel, UniqueConstraint
 
 from .chat import TimestampMixin
+from .portable import PortableIdMixin
 
 if TYPE_CHECKING:
     from .note import Notes
@@ -21,7 +22,7 @@ class DocumentStatus(StrEnum):
     deleted = "deleted"
 
 
-class Document(TimestampMixin, SQLModel, table=True):
+class Document(PortableIdMixin, TimestampMixin, SQLModel, table=True):
     __tablename__: ClassVar[str] = "documents"  # pyright: ignore
     __table_args__ = (
         Index("ix_document_user_created", "user_id", "created_at"),

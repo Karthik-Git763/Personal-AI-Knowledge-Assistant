@@ -137,11 +137,3 @@ def downgrade() -> None:
     for table_name in reversed(PORTABLE_ID_TABLES):
         op.drop_index(f"ix_{table_name}_portable_id", table_name=table_name)
         op.drop_column(table_name, "portable_id")
-
-    op.alter_column(
-        "alembic_version",
-        "version_num",
-        existing_type=sa.String(length=64),
-        type_=sa.String(length=32),
-        existing_nullable=False,
-    )

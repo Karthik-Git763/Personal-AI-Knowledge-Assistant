@@ -14,6 +14,10 @@ if TYPE_CHECKING:
     from .user import User
 
 
+def sanitize_backup_failure_message(value: str | None) -> str | None:
+    return sanitize_plain_text(value) if value is not None else None
+
+
 class BackupStatus(StrEnum):
     pending = "pending"
     running = "running"
@@ -107,12 +111,10 @@ class WorkspaceBackup(TimestampMixin, SQLModel, table=True):
 
     user: "User" = Relationship(back_populates="workspace_backups")
 
-    def __init__(self, **data: Any) -> None:
-        failure_message = data.get("failure_message")
-        if isinstance(failure_message, str):
-            data["failure_message"] = sanitize_plain_text(failure_message)
-        super().__init__(**data)
-
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "failure_message":
+            value = sanitize_backup_failure_message(value)
+        super().__setattr__(name, value)
 
 class BackupSchedule(TimestampMixin, SQLModel, table=True):
     __tablename__: ClassVar[str] = "backup_schedules"  # pyright: ignore
