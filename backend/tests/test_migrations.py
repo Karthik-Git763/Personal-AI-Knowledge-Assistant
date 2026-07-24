@@ -8,6 +8,8 @@ from sqlmodel import SQLModel
 from app.core.database import engine
 
 PORTABLE_ID_TABLES = {
+    "users",
+    "note_templates",
     "notes",
     "note_folders",
     "note_tags",

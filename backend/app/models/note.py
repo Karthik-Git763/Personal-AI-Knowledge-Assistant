@@ -237,9 +237,13 @@ class NoteCategory(StrEnum):
     other = "other"
 
 
-class NoteTemplates(TimestampMixin, SQLModel, table=True):
+class NoteTemplates(PortableIdMixin, TimestampMixin, SQLModel, table=True):
     __tablename__: ClassVar[str] = "note_templates"  # pyright: ignore
     id: int | None = Field(primary_key=True, default=None)
+    portable_id: UUID = Field(
+        default_factory=uuid4,
+        sa_column=Column(PGUUID(as_uuid=True), nullable=False, unique=True, index=True),
+    )
     user_id: int | None = Field(default=None, foreign_key="users.id")
     name: str = Field(nullable=False, max_length=255)
     description: str | None = Field(default=None)

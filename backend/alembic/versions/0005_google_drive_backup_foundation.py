@@ -17,6 +17,8 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 PORTABLE_ID_TABLES = (
+    "users",
+    "note_templates",
     "notes",
     "note_folders",
     "note_tags",

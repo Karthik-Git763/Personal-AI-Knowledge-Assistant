@@ -1,15 +1,18 @@
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, ClassVar, Optional
+from uuid import UUID, uuid4
 
 from pydantic import field_validator
 from sqlalchemy import DateTime
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlmodel import CheckConstraint, Column, Field, Index, Relationship, SQLModel, desc
 
 from app.utils.sanitization import sanitize_plain_text
 
 from .chat import TimestampMixin
+from .portable import PortableIdMixin
 
 if TYPE_CHECKING:
     from .backup import BackupSchedule, GoogleDriveConnection, OAuthState, WorkspaceBackup
@@ -105,13 +108,17 @@ class UpdatePassword(SQLModel):
 
 
 # Table User
-class User(TimestampMixin, UserBase, SQLModel, table=True):
+class User(PortableIdMixin, TimestampMixin, UserBase, SQLModel, table=True):
     __tablename__: ClassVar[str] = "users"  # pyright: ignore[reportIncompatibleVariableOverride]
     __table_args__ = (
         Index("ix_user_email", "email", unique=True),
         Index("ix_users_created_at", "created_at"),
     )
     id: int | None = Field(default=None, primary_key=True)
+    portable_id: UUID = Field(
+        default_factory=uuid4,
+        sa_column=Column(PGUUID(as_uuid=True), nullable=False, unique=True, index=True),
+    )
     hashed_password: str = Field(nullable=False, max_length=255)
     avatar_url: str | None = Field(default=None)
 

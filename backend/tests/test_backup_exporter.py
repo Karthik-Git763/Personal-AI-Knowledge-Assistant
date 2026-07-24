@@ -1,7 +1,9 @@
 import hashlib
 import json
 import os
+from collections.abc import Iterator, Mapping
 from pathlib import Path
+from typing import Any, BinaryIO, cast
 from uuid import UUID
 from zipfile import ZipFile
 
@@ -20,6 +22,8 @@ from app.models.note import (
     NoteTemplates,
 )
 from app.models.user import User, UserSettings
+from app.services import backup_archive
+from app.services import backup_exporter as backup_exporter_module
 from app.services.backup_archive import (
     ArchiveSizeExceeded,
     DuplicateArchiveName,
@@ -139,9 +143,14 @@ def test_export_uses_portable_uuid_relationships_and_excludes_derived_content(
     result = exporter.export(user, tmp_path / "backup.zip")
 
     with ZipFile(result.path) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
         notes = json.loads(archive.read("notes.json"))
         documents = json.loads(archive.read("documents.json"))
         relations = json.loads(archive.read("note_tag_relations.json"))
+        templates = json.loads(archive.read("templates.json"))
+        session_template = exporter.session.exec(select(NoteTemplates)).one()
+        assert manifest["owner_id"] == str(user.portable_id)
+        assert templates[0]["id"] == str(session_template.portable_id)
         assert UUID(notes[0]["folder_id"])
         assert UUID(notes[0]["linked_document_id"])
         assert UUID(notes[0]["linked_chat_session_id"])
@@ -160,8 +169,9 @@ def test_export_writes_deterministic_record_json_and_entry_checksums(
     user, _ = populated_workspace
 
     result = exporter.export(user, tmp_path / "backup.zip")
+    second_result = exporter.export(user, tmp_path / "second-backup.zip")
 
-    with ZipFile(result.path) as archive:
+    with ZipFile(result.path) as archive, ZipFile(second_result.path) as second_archive:
         manifest = json.loads(archive.read("manifest.json"))
         notes = archive.read("notes.json")
         file_name = next(name for name in archive.namelist() if name.startswith("files/documents/"))
@@ -170,6 +180,12 @@ def test_export_writes_deterministic_record_json_and_entry_checksums(
         ).encode("utf-8")
         assert manifest["checksums"]["notes.json"] == hashlib.sha256(notes).hexdigest()
         assert manifest["checksums"][file_name] == hashlib.sha256(archive.read(file_name)).hexdigest()
+        assert archive.namelist() == second_archive.namelist()
+        for name in archive.namelist():
+            if name != "manifest.json":
+                assert archive.read(name) == second_archive.read(name)
+                assert archive.getinfo(name).date_time == second_archive.getinfo(name).date_time
+                assert archive.getinfo(name).external_attr == second_archive.getinfo(name).external_attr
     assert result.archive_checksum == hashlib.sha256(result.path.read_bytes()).hexdigest()
     assert result.archive_size == result.path.stat().st_size
 
@@ -268,3 +284,100 @@ def test_versioned_zip_writer_rejects_duplicate_names_and_size_bound(tmp_path: P
         with VersionedZipWriter(oversized_destination, maximum_size=1) as archive:
             archive.write_bytes("records.json", os.urandom(128))
     assert not oversized_destination.exists()
+
+
+def test_versioned_zip_writer_streams_json_records_with_stable_metadata(tmp_path: Path) -> None:
+    destination = tmp_path / "streamed.zip"
+
+    def records() -> Iterator[Mapping[str, Any]]:
+        yield {"id": "b", "value": 2}
+        yield {"id": "a", "value": 1}
+
+    checksum = ""
+    count = 0
+    with VersionedZipWriter(destination, maximum_size=10_000) as archive:
+        checksum, count = archive.write_json_array("records.json", records())
+
+    with ZipFile(destination) as archive:
+        entry = archive.getinfo("records.json")
+        data = archive.read("records.json")
+    assert count == 2
+    assert checksum == hashlib.sha256(data).hexdigest()
+    assert data == b'[{"id":"b","value":2},{"id":"a","value":1}]'
+    assert entry.date_time == (1980, 1, 1, 0, 0, 0)
+    assert entry.external_attr >> 16 == 0o100644
+
+
+def test_exporter_uses_yield_per_for_bounded_database_iteration(tmp_path: Path) -> None:
+    class ResultDouble:
+        def __init__(self) -> None:
+            self.batch_size: int | None = None
+
+        def yield_per(self, size: int) -> Iterator[int]:
+            self.batch_size = size
+            return iter((1, 2))
+
+    class SessionDouble:
+        def __init__(self, result: ResultDouble) -> None:
+            self.result = result
+
+        def exec(self, _statement: Any) -> ResultDouble:
+            return self.result
+
+    result = ResultDouble()
+    exporter = BackupExporter(
+        session=cast(Session, SessionDouble(result)),
+        upload_root=tmp_path,
+        maximum_archive_size=10_000,
+    )
+
+    assert list(exporter._iterate(select(Notes))) == [1, 2]
+    assert result.batch_size == exporter.BATCH_SIZE
+
+
+def test_validated_source_stream_uses_open_handle_after_path_replacement(tmp_path: Path) -> None:
+    upload_root = tmp_path / "uploads"
+    upload_root.mkdir()
+    source = upload_root / "report.txt"
+    source.write_bytes(b"original")
+
+    with backup_archive.open_validated_source(upload_root, source) as input_file:
+        source.unlink()
+        source.write_bytes(b"replacement")
+        with VersionedZipWriter(tmp_path / "same-handle.zip", maximum_size=10_000) as archive:
+            archive.write_fileobj("report.txt", input_file)
+
+    with ZipFile(tmp_path / "same-handle.zip") as archive:
+        assert archive.read("report.txt") == b"original"
+
+
+def test_export_rejects_cross_owner_relationship_target(
+    populated_workspace: tuple[User, Path], exporter: BackupExporter, session: Session, tmp_path: Path
+) -> None:
+    user, _ = populated_workspace
+    other_user = User(email="other@example.com", hashed_password="hashed-password")
+    session.add(other_user)
+    session.commit()
+    session.refresh(other_user)
+    foreign_folder = NoteFolders(user_id=other_user.id, name="Foreign")
+    session.add(foreign_folder)
+    session.commit()
+    note = session.exec(select(Notes).where(Notes.user_id == user.id, Notes.title == "Current")).one()
+    note.folder_id = foreign_folder.id
+    session.add(note)
+    session.commit()
+
+    with pytest.raises(backup_exporter_module.InvalidBackupReference, match="folder"):
+        exporter.export(user, tmp_path / "invalid-reference.zip")
+
+
+def test_versioned_zip_writer_removes_partial_output_after_mid_write_error(tmp_path: Path) -> None:
+    class BrokenReader:
+        def read(self, size: int) -> bytes:
+            raise OSError("read failed")
+
+    destination = tmp_path / "partial.zip"
+    with pytest.raises(OSError, match="read failed"):
+        with VersionedZipWriter(destination, maximum_size=10_000) as archive:
+            archive.write_fileobj("records.bin", cast(BinaryIO, BrokenReader()))
+    assert not destination.exists()

@@ -14,7 +14,7 @@ from app.models.backup import (
 )
 from app.models.chat import ChatMessages, ChatRole, ChatSession
 from app.models.document import Document
-from app.models.note import NoteFolders, NoteLinks, Notes, NoteTags
+from app.models.note import NoteCategory, NoteFolders, NoteLinks, Notes, NoteTags, NoteTemplates
 from app.models.user import User
 
 
@@ -28,6 +28,7 @@ def test_portable_ids_are_generated_and_distinct() -> None:
 
 def test_all_backupable_models_generate_portable_ids() -> None:
     models = [
+        User(email="portable@example.com", hashed_password="hashed-password"),
         NoteFolders(user_id=1, name="Folder"),
         NoteTags(user_id=1, name="Tag"),
         NoteLinks(source_note_id=1, target_note_id=2),
@@ -42,6 +43,7 @@ def test_all_backupable_models_generate_portable_ids() -> None:
         ),
         ChatSession(user_id=1),
         ChatMessages(session_id=1, role=ChatRole.user, content="Hello"),
+        NoteTemplates(user_id=1, name="Template", category=NoteCategory.other, content="Content"),
     ]
 
     portable_ids = [model.portable_id for model in models]
@@ -108,12 +110,19 @@ def test_portable_ids_are_immutable_after_persistence(session) -> None:
         portable_id=uuid4(),
     )
     chat_session = ChatSession(user_id=1, portable_id=uuid4())
+    template = NoteTemplates(
+        user_id=1,
+        name="Template",
+        category=NoteCategory.other,
+        content="Content",
+        portable_id=uuid4(),
+    )
     first_note = Notes(user_id=1, title="One", content="", portable_id=uuid4())
     second_note = Notes(user_id=1, title="Two", content="", portable_id=uuid4())
 
     session.add(user)
     session.flush()
-    session.add_all([folder, tag, document, chat_session, first_note, second_note])
+    session.add_all([folder, tag, document, chat_session, template, first_note, second_note])
     session.flush()
 
     note_link = NoteLinks(
@@ -130,7 +139,7 @@ def test_portable_ids_are_immutable_after_persistence(session) -> None:
     session.add_all([note_link, chat_message])
     session.commit()
 
-    models = [folder, tag, document, chat_session, first_note, second_note, note_link, chat_message]
+    models = [user, folder, tag, document, chat_session, template, first_note, second_note, note_link, chat_message]
     original_ids = {id(model): model.portable_id for model in models}
 
     for model in models:
