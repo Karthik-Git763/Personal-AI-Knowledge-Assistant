@@ -73,6 +73,7 @@ class BackupExporter:
         if user.id is None:
             raise ValueError("Backup exports require a persisted user")
 
+        default_folder = self._default_preference_folder(user.id)
         backup_id = uuid4()
         created_at = datetime.now(UTC)
         checksums: dict[str, str] = {}
@@ -83,7 +84,7 @@ class BackupExporter:
 
         try:
             with VersionedZipWriter(temporary_destination, self.maximum_archive_size) as archive:
-                for name, records in self._record_streams(user.id):
+                for name, records in self._record_streams(user.id, default_folder):
                     filename = RECORD_FILENAMES[name]
                     checksums[filename], counts[name] = archive.write_json_array(filename, records)
                 self._write_document_files(archive, user.id, checksums)
@@ -112,10 +113,12 @@ class BackupExporter:
             archive_size=destination.stat().st_size,
         )
 
-    def _record_streams(self, user_id: int) -> Iterable[tuple[str, Iterable[Mapping[str, Any]]]]:
+    def _record_streams(
+        self, user_id: int, default_folder: NoteFolders | None
+    ) -> Iterable[tuple[str, Iterable[Mapping[str, Any]]]]:
         return (
             ("notes", self._iter_notes(user_id)),
-            ("folders", self._iter_folders(user_id)),
+            ("folders", self._iter_folders(user_id, default_folder.id if default_folder else None)),
             ("tags", self._iter_tags(user_id)),
             ("note_tag_relations", self._iter_tag_relations(user_id)),
             ("links", self._iter_links(user_id)),
@@ -123,7 +126,7 @@ class BackupExporter:
             ("documents", self._iter_documents(user_id)),
             ("chat_sessions", self._iter_sessions(user_id)),
             ("chat_messages", self._iter_messages(user_id)),
-            ("user_preferences", self._iter_preferences(user_id)),
+            ("user_preferences", self._iter_preferences(user_id, default_folder)),
         )
 
     def _iterate(self, statement: Any) -> Iterator[Any]:
@@ -136,10 +139,12 @@ class BackupExporter:
             if not note.is_deleted or self._is_required_note(note, user_id):
                 yield self._note_record(note, user_id)
 
-    def _iter_folders(self, user_id: int) -> Iterator[Mapping[str, Any]]:
+    def _iter_folders(
+        self, user_id: int, default_folder_id: int | None
+    ) -> Iterator[Mapping[str, Any]]:
         statement = select(NoteFolders).where(NoteFolders.user_id == user_id).order_by(col(NoteFolders.portable_id))
         for folder in self._iterate(statement):
-            if not folder.is_deleted or self._is_referenced_by_live_note("folder_id", folder.id, user_id):
+            if self._is_required_folder(folder, user_id, default_folder_id):
                 yield self._folder_record(folder, user_id)
 
     def _iter_tags(self, user_id: int) -> Iterator[Mapping[str, Any]]:
@@ -234,13 +239,12 @@ class BackupExporter:
                 "content": message.content,
             }
 
-    def _iter_preferences(self, user_id: int) -> Iterator[Mapping[str, Any]]:
+    def _iter_preferences(
+        self, user_id: int, default_folder: NoteFolders | None
+    ) -> Iterator[Mapping[str, Any]]:
         preferences = self.session.get(UserSettings, user_id)
         if preferences is None:
             return
-        default_folder = self._optional_owned(
-            NoteFolders, preferences.default_note_folder_id, user_id, "default note folder"
-        )
         yield {
             "llm_provider": preferences.llm_provider.value,
             "llm_model": preferences.llm_model,
@@ -347,6 +351,32 @@ class BackupExporter:
                 return True
         return False
 
+    def _is_required_folder(
+        self,
+        folder: NoteFolders,
+        user_id: int,
+        default_folder_id: int | None,
+        ancestors: set[int] | None = None,
+    ) -> bool:
+        if folder.id is None:
+            return False
+        if folder.id == default_folder_id or not folder.is_deleted:
+            return True
+        if self._is_referenced_by_live_note("folder_id", folder.id, user_id):
+            return True
+        ancestor_ids = ancestors or set()
+        if folder.id in ancestor_ids:
+            raise InvalidBackupReference("Backup folder hierarchy contains a cycle")
+        child_statement = (
+            select(NoteFolders)
+            .where(NoteFolders.user_id == user_id, NoteFolders.parent_folder_id == folder.id)
+            .order_by(col(NoteFolders.portable_id))
+        )
+        for child in self._iterate(child_statement):
+            if self._is_required_folder(child, user_id, default_folder_id, ancestor_ids | {folder.id}):
+                return True
+        return False
+
     def _is_referenced_by_live_note(self, attribute: str, identifier: int | None, user_id: int) -> bool:
         if identifier is None:
             return False
@@ -357,6 +387,14 @@ class BackupExporter:
             relationship == identifier,
         )
         return self.session.exec(statement.limit(1)).first() is not None
+
+    def _default_preference_folder(self, user_id: int) -> NoteFolders | None:
+        preferences = self.session.get(UserSettings, user_id)
+        if preferences is None:
+            return None
+        return self._optional_owned(
+            NoteFolders, preferences.default_note_folder_id, user_id, "default note folder"
+        )
 
     def _get(self, model_type: Any, identifier: int | None, relationship: str) -> Any:
         if identifier is None:

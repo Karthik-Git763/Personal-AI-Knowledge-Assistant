@@ -151,9 +151,10 @@ def test_export_uses_portable_uuid_relationships_and_excludes_derived_content(
         session_template = exporter.session.exec(select(NoteTemplates)).one()
         assert manifest["owner_id"] == str(user.portable_id)
         assert templates[0]["id"] == str(session_template.portable_id)
-        assert UUID(notes[0]["folder_id"])
-        assert UUID(notes[0]["linked_document_id"])
-        assert UUID(notes[0]["linked_chat_session_id"])
+        linked_note = next(note for note in notes if note["folder_id"] is not None)
+        assert UUID(linked_note["folder_id"])
+        assert UUID(linked_note["linked_document_id"])
+        assert UUID(linked_note["linked_chat_session_id"])
         assert UUID(relations[0]["note_id"])
         assert UUID(relations[0]["tag_id"])
         assert "content" not in documents[0]
@@ -228,6 +229,60 @@ def test_export_includes_only_soft_deleted_notes_needed_by_live_links(
         exported_ids = {record["id"] for record in json.loads(archive.read("notes.json"))}
     assert str(linked_deleted_note.portable_id) in exported_ids
     assert str(unrelated_deleted_note.portable_id) not in exported_ids
+
+
+def test_export_includes_deleted_ancestor_chain_for_exported_folder(
+    populated_workspace: tuple[User, Path],
+    exporter: BackupExporter,
+    session: Session,
+    tmp_path: Path,
+) -> None:
+    user, _ = populated_workspace
+    root = NoteFolders(user_id=user.id, name="Deleted root", is_deleted=True)
+    session.add(root)
+    session.commit()
+    parent = NoteFolders(user_id=user.id, name="Deleted parent", parent_folder_id=root.id, is_deleted=True)
+    session.add(parent)
+    session.flush()
+    child = NoteFolders(user_id=user.id, name="Live child", parent_folder_id=parent.id)
+    session.add(child)
+    session.commit()
+    note = session.exec(select(Notes).where(Notes.user_id == user.id, Notes.title == "Current")).one()
+    note.folder_id = child.id
+    session.add(note)
+    session.commit()
+
+    result = exporter.export(user, tmp_path / "ancestor-chain.zip")
+
+    with ZipFile(result.path) as archive:
+        folders = json.loads(archive.read("folders.json"))
+    exported_ids = {folder["id"] for folder in folders}
+    assert {str(root.portable_id), str(parent.portable_id), str(child.portable_id)} <= exported_ids
+
+
+def test_export_includes_deleted_default_preference_folder(
+    populated_workspace: tuple[User, Path],
+    exporter: BackupExporter,
+    session: Session,
+    tmp_path: Path,
+) -> None:
+    user, _ = populated_workspace
+    default_folder = NoteFolders(user_id=user.id, name="Deleted default", is_deleted=True)
+    session.add(default_folder)
+    session.commit()
+    preferences = session.get(UserSettings, user.id)
+    assert preferences is not None
+    preferences.default_note_folder_id = default_folder.id
+    session.add(preferences)
+    session.commit()
+
+    result = exporter.export(user, tmp_path / "default-folder.zip")
+
+    with ZipFile(result.path) as archive:
+        folders = json.loads(archive.read("folders.json"))
+        preferences_record = json.loads(archive.read("user_preferences.json"))[0]
+    assert str(default_folder.portable_id) in {folder["id"] for folder in folders}
+    assert preferences_record["default_note_folder_id"] == str(default_folder.portable_id)
 
 
 def test_export_rejects_missing_source_and_removes_partial_archive(
