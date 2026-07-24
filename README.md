@@ -13,6 +13,7 @@ Cognolith is a self-hosted knowledge workspace for connected notes, document ing
 - Conversational chat with grounded answers from documents and notes when relevant
 - Authenticated, user-isolated workspaces
 - Six-digit email verification with automatic sign-in
+- Optional Google Drive workspace backups and cross-platform recovery
 - Optional local model integration through Ollama
 
 <!--## Screenshots
@@ -105,11 +106,58 @@ The main settings are:
 | `SMTP_USER` | SMTP username; for Gmail this is the sending Gmail address |
 | `SMTP_PASSWORD` | SMTP password; for Gmail this is a Google app password |
 | `EMAILS_FROM_EMAIL` | Sender address for verification emails |
+| `GOOGLE_DRIVE_CLIENT_ID` | Google OAuth Web client ID; leave blank to disable Drive backups |
+| `GOOGLE_DRIVE_CLIENT_SECRET` | Google OAuth Web client secret |
+| `GOOGLE_DRIVE_REDIRECT_URI` | Exact backend OAuth callback registered with Google |
+| `GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY` | Fernet key used to encrypt stored Google refresh tokens |
 | `OLLAMA_BASE_URL` | Optional Ollama endpoint |
 | `NEXT_PUBLIC_API_URL` | Browser API base URL for standard requests |
 | `NEXT_PUBLIC_STREAM_API_URL` | SSE-capable public backend URL; local Docker uses `http://localhost:3000/api/v1` |
 
 Local Docker uses Mailpit, so verification emails stay on the machine and can be read at `http://localhost:8025`. Production deployments must provide a real SMTP host and sender address.
+
+### Google Drive backups
+
+Google Drive backup is optional and remains disabled when its credentials are blank. Cognolith requests only Google's [`drive.appdata`](https://developers.google.com/workspace/drive/api/guides/appdata) scope and stores snapshots in the hidden application-data folder. The app cannot browse or modify the user's normal Drive files, and snapshots do not appear in the standard Drive interface.
+
+Configure Google OAuth:
+
+1. Create or select a project in [Google Cloud Console](https://console.cloud.google.com/).
+2. Enable the [Google Drive API](https://console.cloud.google.com/apis/library/drive.googleapis.com).
+3. Configure the OAuth consent screen. Add intended accounts as test users while the app remains in testing.
+4. Create an [OAuth client](https://support.google.com/cloud/answer/15549257) with application type **Web application**.
+5. Add the exact authorized redirect URI. Local Docker uses:
+
+   ```text
+   http://localhost:3000/api/v1/users/me/google-drive/callback
+   ```
+
+   Production must use the public backend origin with the same path, for example `https://api.example.com/api/v1/users/me/google-drive/callback`.
+
+6. Set `GOOGLE_DRIVE_CLIENT_ID`, `GOOGLE_DRIVE_CLIENT_SECRET`, and `GOOGLE_DRIVE_REDIRECT_URI` in the uncommitted `.env`.
+7. Generate a dedicated Fernet key and set `GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY`:
+
+   ```bash
+   docker compose run --rm --no-deps backend python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+   ```
+
+Keep the Fernet key stable and secret. Losing or rotating it without a migration prevents Cognolith from decrypting existing Google refresh tokens. Restart the backend after changing OAuth configuration.
+
+Each snapshot includes note content and hierarchy, tags and note links, note templates, original uploaded documents and their metadata, chat sessions and messages, and workspace preferences. It excludes passwords, sessions, verification codes, Google credentials, backup history, logs, Ollama models, and derived data such as embeddings, document chunks, extracted previews, summaries, and chat diagnostics. Derived document content is rebuilt after restore.
+
+After Drive is connected, Cognolith schedules a backup every 24 hours. A backend that was offline catches up after startup; opening backup settings also starts an overdue backup. Users can start a manual backup at any time when no backup or restore is active. Normal retention keeps the newest five completed snapshots. A restore first creates an additional safety snapshot of the current workspace.
+
+Restore is an explicit replacement operation: after preview and `RESTORE` confirmation, the selected snapshot replaces the current notes, documents, chats, relationships, and preferences. To recover on another device or Cognolith installation, sign in to Cognolith, connect the same Google account, select a compatible snapshot, and restore it. Stable workspace identifiers preserve relationships across installations.
+
+Troubleshooting:
+
+- **Not configured:** set the client ID, client secret, and Fernet key, verify the redirect URI, then restart the backend.
+- **Redirect mismatch:** make the Cloud Console redirect URI and `GOOGLE_DRIVE_REDIRECT_URI` identical, including scheme, host, port, and path.
+- **Authorization failed:** confirm the Drive API is enabled, the account is an allowed consent-screen test user, and reconnect from Settings.
+- **Reconnect required:** the refresh token was revoked or expired; reconnect the same Google account.
+- **Temporary provider error:** retry after network or Google API availability recovers.
+- **Snapshots are not visible in Drive:** this is expected for the hidden `appDataFolder`.
+- **Restore is rejected:** use an unmodified, compatible Cognolith snapshot. Checksum, ownership, and archive validation failures are intentionally reported without provider credentials or response bodies.
 
 ### Database migrations
 

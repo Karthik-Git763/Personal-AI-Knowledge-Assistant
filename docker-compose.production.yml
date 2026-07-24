@@ -8,6 +8,8 @@ services:
       PORT: 3000
       SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required}
       SIGNUP_RATE_LIMIT: ${SIGNUP_RATE_LIMIT:-5/hour}
+      # Optional Google Drive backup. Set all credentials together and replace
+      # the local callback default with the public backend callback URI.
       GOOGLE_DRIVE_CLIENT_ID: ${GOOGLE_DRIVE_CLIENT_ID:-}
       GOOGLE_DRIVE_CLIENT_SECRET: ${GOOGLE_DRIVE_CLIENT_SECRET:-}
       GOOGLE_DRIVE_REDIRECT_URI: ${GOOGLE_DRIVE_REDIRECT_URI:-http://localhost:3000/api/v1/users/me/google-drive/callback}

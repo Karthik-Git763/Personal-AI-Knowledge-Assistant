@@ -79,4 +79,8 @@ uploads
 node_modules/
 .docs
 docs
-.superpowers/sdd/task-7-report.md
+
+# Local planning and backup runtime artifacts
+.superpowers/
+backup-temp/
+recovery-journal.json
