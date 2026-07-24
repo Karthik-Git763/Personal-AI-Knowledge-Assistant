@@ -22,6 +22,14 @@ class GoogleDriveOAuthError(RuntimeError):
     """Raised for OAuth failures without provider payload details."""
 
 
+class GoogleDriveOAuthRetryableError(GoogleDriveOAuthError):
+    """Raised when an OAuth operation can be retried safely."""
+
+
+class GoogleDriveOAuthReauthorizationRequiredError(GoogleDriveOAuthError):
+    """Raised when the Google grant is no longer valid."""
+
+
 class GoogleDriveOAuthService:
     AUTHORIZATION_URL = "https://accounts.google.com/o/oauth2/v2/auth"
     TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -186,6 +194,12 @@ class GoogleDriveOAuthService:
         access_token = self._required_string(
             token_payload, "access_token", "Google Drive access token could not be refreshed"
         )
+        replacement_refresh_token = token_payload.get("refresh_token")
+        if isinstance(replacement_refresh_token, str) and replacement_refresh_token:
+            connection.encrypted_refresh_token = encrypt_provider_token(
+                replacement_refresh_token,
+                encryption_key=self.settings.GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY,
+            )
         connection.token_expires_at = self._expires_at(token_payload)
         self.session.add(connection)
         self.session.commit()
@@ -221,27 +235,48 @@ class GoogleDriveOAuthService:
         self, url: str, data: dict[str, str | None], failure_message: str
     ) -> dict[str, Any]:
         response = await self._post(url, data=data)
-        if response.is_error:
-            raise GoogleDriveOAuthError(failure_message)
+        self._raise_for_oauth_error(response, failure_message)
         return self._json_payload(response, failure_message)
 
     async def _get_json(
         self, url: str, headers: dict[str, str], failure_message: str
     ) -> dict[str, Any]:
-        if self.client is not None:
-            response = await self.client.get(url, headers=headers)
-        else:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.get(url, headers=headers)
-        if response.is_error:
-            raise GoogleDriveOAuthError(failure_message)
+        try:
+            if self.client is not None:
+                response = await self.client.get(url, headers=headers)
+            else:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.get(url, headers=headers)
+        except httpx.RequestError as error:
+            raise GoogleDriveOAuthRetryableError(failure_message) from error
+        self._raise_for_oauth_error(response, failure_message)
         return self._json_payload(response, failure_message)
 
     async def _post(self, url: str, data: dict[str, str | None]) -> httpx.Response:
-        if self.client is not None:
-            return await self.client.post(url, data=data)
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            return await client.post(url, data=data)
+        try:
+            if self.client is not None:
+                return await self.client.post(url, data=data)
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                return await client.post(url, data=data)
+        except httpx.RequestError as error:
+            raise GoogleDriveOAuthRetryableError("Google Drive request could not be completed") from error
+
+    @staticmethod
+    def _raise_for_oauth_error(response: httpx.Response, failure_message: str) -> None:
+        if response.status_code == 429 or response.status_code >= 500:
+            raise GoogleDriveOAuthRetryableError(failure_message)
+        if response.status_code == 401 or GoogleDriveOAuthService._is_invalid_grant(response):
+            raise GoogleDriveOAuthReauthorizationRequiredError(failure_message)
+        if response.is_error:
+            raise GoogleDriveOAuthError(failure_message)
+
+    @staticmethod
+    def _is_invalid_grant(response: httpx.Response) -> bool:
+        try:
+            payload = response.json()
+        except ValueError:
+            return False
+        return isinstance(payload, dict) and payload.get("error") == "invalid_grant"
 
     @staticmethod
     def _json_payload(response: httpx.Response, failure_message: str) -> dict[str, Any]:

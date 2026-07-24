@@ -11,9 +11,9 @@ from sqlmodel import Session
 
 from app.core.config import Settings
 from app.core.security import encrypt_provider_token
-from app.models.backup import GoogleDriveConnection
+from app.models.backup import BackupStatus, GoogleDriveConnection, WorkspaceBackup
 from app.models.user import User
-from app.services.backup_store import BackupObjectMetadata
+from app.services.backup_store import BackupObjectMetadata, StoredBackup
 from app.services.google_drive_oauth import GoogleDriveOAuthService
 from app.services.google_drive_store import (
     GoogleDriveMalformedPayloadError,
@@ -26,6 +26,7 @@ from app.services.google_drive_store import (
 ARCHIVE_BYTES = b"cognolith-backup-contents"
 CHECKSUM = "a" * 64
 REMOTE_ID = "drive_file_12345"
+SERVER_CREATED_AT = datetime(2026, 7, 24, 12, 5, tzinfo=UTC)
 
 
 def _settings() -> Settings:
@@ -79,12 +80,20 @@ def _metadata(owner_id: UUID) -> BackupObjectMetadata:
     )
 
 
-def _drive_file(metadata: BackupObjectMetadata, *, completed: bool = True) -> dict[str, Any]:
+def _drive_file(
+    metadata: BackupObjectMetadata,
+    *,
+    completed: bool = True,
+    remote_id: str = REMOTE_ID,
+    parents: list[str] | None = None,
+    server_created_at: datetime = SERVER_CREATED_AT,
+) -> dict[str, Any]:
     return {
-        "id": REMOTE_ID,
+        "id": remote_id,
         "name": f"cognolith-{metadata.backup_id}.zip",
         "size": str(len(ARCHIVE_BYTES)),
-        "createdTime": metadata.created_at.isoformat().replace("+00:00", "Z"),
+        "createdTime": server_created_at.isoformat().replace("+00:00", "Z"),
+        "parents": parents if parents is not None else ["appDataFolder"],
         "appProperties": {
             "cognolith": "backup",
             "owner_id": str(metadata.owner_id),
@@ -95,6 +104,17 @@ def _drive_file(metadata: BackupObjectMetadata, *, completed: bool = True) -> di
             "completed": str(completed).lower(),
         },
     }
+
+
+def _stored_backup(metadata: BackupObjectMetadata) -> StoredBackup:
+    return StoredBackup(
+        remote_id=REMOTE_ID,
+        name=f"cognolith-{metadata.backup_id}.zip",
+        size=len(ARCHIVE_BYTES),
+        created_at=metadata.created_at,
+        metadata=metadata,
+        completed=True,
+    )
 
 
 async def _store(
@@ -161,6 +181,7 @@ async def test_upload_uses_resumable_appdata_and_marks_validated_file_complete(
 
     assert uploaded.remote_id == REMOTE_ID
     assert uploaded.completed is True
+    assert uploaded.created_at == metadata.created_at
     assert [request.method for request in requests] == ["POST", "POST", "PUT", "PATCH"]
 
 
@@ -212,6 +233,59 @@ async def test_list_returns_only_valid_owner_backups_and_authorizes_remote_id_fo
         await store.aclose()
 
     assert listed[0].metadata == metadata
+    assert listed[0].created_at == metadata.created_at
+
+
+@pytest.mark.asyncio
+async def test_list_rejects_backups_without_appdatafolder_parent(
+    session: Session, configured_token_encryption: Settings
+) -> None:
+    metadata: BackupObjectMetadata | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url == GoogleDriveOAuthService.TOKEN_URL:
+            return _token_response(request)
+        assert metadata is not None
+        return httpx.Response(200, json={"files": [_drive_file(metadata, parents=["root"])]})
+
+    store, owner_id = await _store(session, configured_token_encryption, handler)
+    metadata = _metadata(owner_id)
+    try:
+        with pytest.raises(GoogleDriveMalformedPayloadError, match="parent"):
+            await store.list(owner_id)
+    finally:
+        await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_upload_rejects_completion_patch_for_a_different_remote_id(
+    session: Session, tmp_path: Path, configured_token_encryption: Settings
+) -> None:
+    archive = tmp_path / "archive.zip"
+    archive.write_bytes(ARCHIVE_BYTES)
+    metadata: BackupObjectMetadata | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url == GoogleDriveOAuthService.TOKEN_URL:
+            return _token_response(request)
+        if request.method == "POST":
+            return httpx.Response(200, headers={"Location": "https://upload.example/session"})
+        assert metadata is not None
+        if request.method == "PUT":
+            return httpx.Response(200, json=_drive_file(metadata, completed=False))
+        if request.method == "PATCH":
+            return httpx.Response(
+                200, json=_drive_file(metadata, completed=True, remote_id="other_file_67890")
+            )
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    store, owner_id = await _store(session, configured_token_encryption, handler)
+    metadata = _metadata(owner_id)
+    try:
+        with pytest.raises(GoogleDriveMalformedPayloadError, match="identifier"):
+            await store.upload(archive, metadata)
+    finally:
+        await store.aclose()
 
 
 @pytest.mark.asyncio
@@ -265,6 +339,22 @@ async def test_transient_drive_responses_are_retryable(
 
 
 @pytest.mark.asyncio
+async def test_transient_token_refresh_is_retryable_for_store_operations(
+    session: Session, configured_token_encryption: Settings
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == GoogleDriveOAuthService.TOKEN_URL
+        return httpx.Response(429)
+
+    store, owner_id = await _store(session, configured_token_encryption, handler)
+    try:
+        with pytest.raises(GoogleDriveRetryableError):
+            await store.list(owner_id)
+    finally:
+        await store.aclose()
+
+
+@pytest.mark.asyncio
 async def test_download_streams_to_atomic_destination_and_cleans_up_oversize_temp_file(
     session: Session, tmp_path: Path, configured_token_encryption: Settings
 ) -> None:
@@ -277,8 +367,8 @@ async def test_download_streams_to_atomic_destination_and_cleans_up_oversize_tem
         assert request.url.params["alt"] == "media"
         return httpx.Response(200, content=b"x" * 65)
 
-    store, _ = await _store(session, configured_token_encryption, handler)
-    store.authorize_remote_id(REMOTE_ID)
+    store, owner_id = await _store(session, configured_token_encryption, handler)
+    store.authorize_backup(_stored_backup(_metadata(owner_id)))
     try:
         with pytest.raises(ValueError, match="maximum"):
             await store.download(REMOTE_ID, destination)
@@ -286,6 +376,29 @@ async def test_download_streams_to_atomic_destination_and_cleans_up_oversize_tem
         await store.aclose()
 
     assert destination.read_bytes() == b"previous"
+    assert list(tmp_path.iterdir()) == [destination]
+
+
+@pytest.mark.asyncio
+async def test_download_atomically_replaces_destination_after_success(
+    session: Session, tmp_path: Path, configured_token_encryption: Settings
+) -> None:
+    destination = tmp_path / "restored.zip"
+    destination.write_bytes(b"previous")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url == GoogleDriveOAuthService.TOKEN_URL:
+            return _token_response(request)
+        return httpx.Response(200, content=ARCHIVE_BYTES)
+
+    store, owner_id = await _store(session, configured_token_encryption, handler)
+    store.authorize_backup(_stored_backup(_metadata(owner_id)))
+    try:
+        assert await store.download(REMOTE_ID, destination) == destination
+    finally:
+        await store.aclose()
+
+    assert destination.read_bytes() == ARCHIVE_BYTES
     assert list(tmp_path.iterdir()) == [destination]
 
 
@@ -298,10 +411,41 @@ async def test_download_maps_transport_errors_to_retryable_provider_errors(
             return _token_response(request)
         raise httpx.ConnectError("network unavailable", request=request)
 
-    store, _ = await _store(session, configured_token_encryption, handler)
-    store.authorize_remote_id(REMOTE_ID)
+    store, owner_id = await _store(session, configured_token_encryption, handler)
+    store.authorize_backup(_stored_backup(_metadata(owner_id)))
     try:
         with pytest.raises(GoogleDriveRetryableError):
             await store.download(REMOTE_ID, tmp_path / "restored.zip")
+    finally:
+        await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_delete_accepts_only_locally_validated_backup_identity(
+    session: Session, configured_token_encryption: Settings
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url == GoogleDriveOAuthService.TOKEN_URL:
+            return _token_response(request)
+        assert request.method == "DELETE"
+        return httpx.Response(204)
+
+    store, owner_id = await _store(session, configured_token_encryption, handler)
+    backup = _stored_backup(_metadata(owner_id))
+    workspace_backup = WorkspaceBackup(
+        user_id=store.connection.user_id,
+        remote_file_id=REMOTE_ID,
+        status=BackupStatus.completed,
+        schema_version=1,
+        archive_size_bytes=len(ARCHIVE_BYTES),
+        checksum=CHECKSUM,
+    )
+    try:
+        with pytest.raises(TypeError):
+            store.authorize_backup(REMOTE_ID)  # type: ignore[arg-type]
+        store.authorize_backup(backup)
+        await store.delete(REMOTE_ID)
+        store.authorize_backup(workspace_backup)
+        await store.delete(REMOTE_ID)
     finally:
         await store.aclose()

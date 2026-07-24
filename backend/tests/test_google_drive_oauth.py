@@ -27,6 +27,8 @@ from app.schemas.backup import (
 )
 from app.services.google_drive_oauth import (
     GoogleDriveOAuthError,
+    GoogleDriveOAuthReauthorizationRequiredError,
+    GoogleDriveOAuthRetryableError,
     GoogleDriveOAuthService,
     InvalidOAuthState,
 )
@@ -418,6 +420,111 @@ async def test_refresh_access_token_uses_google_token_endpoint(session: Session)
 
     assert access_token == "new-access-secret"
     assert connection.token_expires_at is not None
+
+
+@pytest.mark.asyncio
+async def test_refresh_access_token_persists_rotated_refresh_token(session: Session) -> None:
+    user = _create_user(session)
+    settings = _settings()
+    connection = GoogleDriveConnection(
+        user_id=user.id,
+        encrypted_refresh_token=_encrypt_with_settings("old-refresh-secret", settings),
+        google_subject="google-subject",
+        google_email=user.email,
+        granted_scopes=[REQUIRED_SCOPE],
+    )
+    session.add(connection)
+    session.commit()
+
+    def refresh_response(request: httpx.Request) -> httpx.Response:
+        assert request.url == GoogleDriveOAuthService.TOKEN_URL
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "new-access-secret",
+                "refresh_token": "rotated-refresh-secret",
+                "expires_in": 3600,
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(refresh_response)) as client:
+        await _oauth_service(session, client, settings).refresh_access_token(connection)
+
+    assert b"rotated-refresh-secret" not in connection.encrypted_refresh_token
+    assert (
+        decrypt_provider_token(
+            connection.encrypted_refresh_token,
+            encryption_key=settings.GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY,
+        )
+        == "rotated-refresh-secret"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [429, 500, 503])
+async def test_refresh_access_token_maps_transient_responses_to_retryable_error(
+    session: Session, status: int
+) -> None:
+    user = _create_user(session)
+    settings = _settings()
+    connection = GoogleDriveConnection(
+        user_id=user.id,
+        encrypted_refresh_token=_encrypt_with_settings("refresh-secret", settings),
+        google_subject="google-subject",
+        google_email=user.email,
+        granted_scopes=[REQUIRED_SCOPE],
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(status))
+    ) as client:
+        with pytest.raises(GoogleDriveOAuthRetryableError):
+            await _oauth_service(session, client, settings).refresh_access_token(connection)
+
+
+@pytest.mark.asyncio
+async def test_refresh_access_token_maps_transport_error_to_retryable_error(session: Session) -> None:
+    user = _create_user(session)
+    settings = _settings()
+    connection = GoogleDriveConnection(
+        user_id=user.id,
+        encrypted_refresh_token=_encrypt_with_settings("refresh-secret", settings),
+        google_subject="google-subject",
+        google_email=user.email,
+        granted_scopes=[REQUIRED_SCOPE],
+    )
+
+    def transport_error(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("network unavailable", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport_error)) as client:
+        with pytest.raises(GoogleDriveOAuthRetryableError):
+            await _oauth_service(session, client, settings).refresh_access_token(connection)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "payload"),
+    [(401, {}), (400, {"error": "invalid_grant"})],
+)
+async def test_refresh_access_token_maps_revocation_to_reauthorization_error(
+    session: Session, status: int, payload: dict[str, str]
+) -> None:
+    user = _create_user(session)
+    settings = _settings()
+    connection = GoogleDriveConnection(
+        user_id=user.id,
+        encrypted_refresh_token=_encrypt_with_settings("refresh-secret", settings),
+        google_subject="google-subject",
+        google_email=user.email,
+        granted_scopes=[REQUIRED_SCOPE],
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(status, json=payload))
+    ) as client:
+        with pytest.raises(GoogleDriveOAuthReauthorizationRequiredError):
+            await _oauth_service(session, client, settings).refresh_access_token(connection)
 
 
 @pytest.mark.asyncio

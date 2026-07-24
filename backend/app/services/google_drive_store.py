@@ -14,9 +14,18 @@ import httpx
 
 from app.core.config import Settings
 from app.core.config import settings as default_settings
-from app.models.backup import GoogleDriveConnection
-from app.services.backup_store import BackupObjectMetadata, StoredBackup
-from app.services.google_drive_oauth import GoogleDriveOAuthError, GoogleDriveOAuthService
+from app.models.backup import BackupStatus, GoogleDriveConnection, WorkspaceBackup
+from app.services.backup_store import (
+    BackupObjectMetadata,
+    StoredBackup,
+    is_valid_stored_backup,
+)
+from app.services.google_drive_oauth import (
+    GoogleDriveOAuthError,
+    GoogleDriveOAuthReauthorizationRequiredError,
+    GoogleDriveOAuthRetryableError,
+    GoogleDriveOAuthService,
+)
 
 
 class GoogleDriveStoreError(RuntimeError):
@@ -45,7 +54,7 @@ class GoogleDriveStore:
     _CHUNK_SIZE = 64 * 1024
     _REMOTE_ID = re.compile(r"[A-Za-z0-9_-]{10,200}")
     _CHECKSUM = re.compile(r"[0-9a-f]{64}")
-    _FIELDS = "id,name,size,createdTime,appProperties"
+    _FIELDS = "id,name,size,createdTime,parents,appProperties"
 
     def __init__(
         self,
@@ -117,6 +126,8 @@ class GoogleDriveStore:
         completed = self._parse_backup(
             self._json_object(completion_response), metadata=metadata, completed=True, size=size
         )
+        if completed.remote_id != uploaded.remote_id:
+            raise GoogleDriveMalformedPayloadError("Google Drive completion changed the file identifier")
         self._trusted_remote_ids.add(completed.remote_id)
         return completed
 
@@ -156,20 +167,22 @@ class GoogleDriveStore:
     async def download(self, remote_id: str, destination: Path) -> Path:
         self._require_trusted_remote_id(remote_id)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        temp_file = tempfile.NamedTemporaryFile(
+        temporary_handle = tempfile.NamedTemporaryFile(
             mode="wb", delete=False, dir=destination.parent, prefix=f".{destination.name}.", suffix=".part"
         )
-        temporary = Path(temp_file.name)
+        temporary = Path(temporary_handle.name)
+        temporary_handle.close()
         try:
+            authorization_headers = await self._authorization_headers()
             async with self.client.stream(
                 "GET",
                 f"{self.DRIVE_API_URL}/files/{remote_id}",
                 params={"alt": "media"},
-                headers=await self._authorization_headers(),
+                headers=authorization_headers,
             ) as response:
                 self._check_response(response)
                 size = 0
-                with temp_file:
+                with temporary.open("wb") as temp_file:
                     async for chunk in response.aiter_bytes(self._CHUNK_SIZE):
                         size += len(chunk)
                         if size > self.settings.BACKUP_MAX_ARCHIVE_SIZE:
@@ -178,19 +191,41 @@ class GoogleDriveStore:
                     temp_file.flush()
                     os.fsync(temp_file.fileno())
             os.replace(temporary, destination)
-            return destination
         except httpx.RequestError as error:
+            self._unlink_after_failure(temporary)
             raise GoogleDriveRetryableError("Google Drive request could not be completed") from error
-        finally:
-            temporary.unlink(missing_ok=True)
+        except BaseException:
+            self._unlink_after_failure(temporary)
+            raise
+        temporary.unlink(missing_ok=True)
+        return destination
 
     async def delete(self, remote_id: str) -> None:
         self._require_trusted_remote_id(remote_id)
         await self._request("DELETE", f"{self.DRIVE_API_URL}/files/{remote_id}")
         self._trusted_remote_ids.discard(remote_id)
 
-    def authorize_remote_id(self, remote_id: str) -> None:
-        """Allow an ID obtained from a locally validated backup record to be operated on."""
+    def authorize_backup(self, backup: StoredBackup | WorkspaceBackup) -> None:
+        """Allow an ID from a validated stored backup or completed local backup record."""
+        if isinstance(backup, StoredBackup):
+            if not is_valid_stored_backup(backup, self.owner_id):
+                raise ValueError("Stored backup is not valid for this owner")
+            remote_id = backup.remote_id
+        elif isinstance(backup, WorkspaceBackup):
+            remote_id = backup.remote_file_id
+            if (
+                backup.user_id != self.connection.user_id
+                or backup.status != BackupStatus.completed
+                or not remote_id
+                or backup.schema_version < 1
+                or backup.archive_size_bytes is None
+                or backup.archive_size_bytes < 0
+                or not backup.checksum
+                or not self._CHECKSUM.fullmatch(backup.checksum)
+            ):
+                raise ValueError("Workspace backup is not a validated completed backup")
+        else:
+            raise TypeError("Backup authorization requires a stored or workspace backup")
         self._validate_remote_id(remote_id)
         self._trusted_remote_ids.add(remote_id)
 
@@ -210,6 +245,10 @@ class GoogleDriveStore:
     async def _authorization_headers(self) -> dict[str, str]:
         try:
             token = await self.oauth_service.refresh_access_token(self.connection)
+        except GoogleDriveOAuthRetryableError as error:
+            raise GoogleDriveRetryableError("Google Drive authorization is temporarily unavailable") from error
+        except GoogleDriveOAuthReauthorizationRequiredError as error:
+            raise GoogleDriveReauthorizationRequiredError("Google Drive authorization is required") from error
         except GoogleDriveOAuthError as error:
             raise GoogleDriveReauthorizationRequiredError("Google Drive authorization is required") from error
         return {"Authorization": f"Bearer {token}"}
@@ -244,14 +283,19 @@ class GoogleDriveStore:
             raise GoogleDriveMalformedPayloadError("Google Drive file properties are invalid")
         parsed_metadata = self._metadata_from_properties(properties)
         parsed_completed = self._completed_property(properties)
-        created_at = self._parse_datetime(self._required_string(raw_file, "createdTime"))
-        if created_at != parsed_metadata.created_at:
-            raise GoogleDriveMalformedPayloadError("Google Drive file creation timestamps disagree")
+        self._parse_datetime(self._required_string(raw_file, "createdTime"))
+        parents = raw_file.get("parents")
+        if (
+            not isinstance(parents, list)
+            or not all(isinstance(parent, str) for parent in parents)
+            or "appDataFolder" not in parents
+        ):
+            raise GoogleDriveMalformedPayloadError("Google Drive file parent is invalid")
         backup = StoredBackup(
             remote_id=remote_id,
             name=name,
             size=parsed_size,
-            created_at=created_at,
+            created_at=parsed_metadata.created_at,
             metadata=parsed_metadata,
             completed=parsed_completed,
         )
@@ -354,6 +398,13 @@ class GoogleDriveStore:
             return False
         parsed = urlparse(location)
         return parsed.scheme == "https" and bool(parsed.netloc)
+
+    @staticmethod
+    def _unlink_after_failure(temporary: Path) -> None:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     async def _stream_file(self, archive: Path) -> AsyncIterator[bytes]:
         with archive.open("rb") as source:
