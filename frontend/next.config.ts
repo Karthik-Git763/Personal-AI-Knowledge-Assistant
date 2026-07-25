@@ -1,8 +1,9 @@
 import type { NextConfig } from "next";
+import path from "node:path";
 
 const nextConfig: NextConfig = {
   output: "standalone",
-  outputFileTracingRoot: process.cwd(),
+  outputFileTracingRoot: path.join(process.cwd(), ".."),
   experimental: {
     proxyTimeout: 120_000,
   },

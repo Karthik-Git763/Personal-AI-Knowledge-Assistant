@@ -5,12 +5,14 @@ WORKDIR /app
 # Keep Docker installs aligned with the lockfile and workspace policy.
 RUN corepack enable && corepack prepare pnpm@11.11.0 --activate
 
-# Install dependencies first for better layer caching
-COPY frontend/package.json frontend/pnpm-lock.yaml frontend/pnpm-workspace.yaml ./
-RUN pnpm install --no-frozen-lockfile
+# Install from the canonical workspace lockfile used by CI.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY frontend/package.json ./frontend/package.json
+RUN pnpm install --frozen-lockfile --filter @cognolith/frontend...
 
 # Copy frontend source
-COPY frontend/ ./
+COPY frontend/ ./frontend/
+WORKDIR /app/frontend
 
 # Browser-side API base URL baked into the frontend build
 # Use relative path for browser requests (will proxy to backend)
@@ -36,12 +38,12 @@ ENV NODE_ENV=production \
 RUN addgroup --system --gid 1001 nodejs && \
     adduser --system --uid 1001 nextjs
 
-COPY --from=builder --chown=nextjs:nodejs /app/public ./public
-COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
-COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+COPY --from=builder --chown=nextjs:nodejs /app/frontend/public ./frontend/public
+COPY --from=builder --chown=nextjs:nodejs /app/frontend/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/frontend/.next/static ./frontend/.next/static
 
 USER nextjs
 
 EXPOSE 3000
 
-CMD ["node", "server.js"]
+CMD ["node", "frontend/server.js"]
