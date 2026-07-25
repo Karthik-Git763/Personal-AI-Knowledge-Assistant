@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".docs/img/logo_img.png" alt="Cognolith - connected notes, graph, search, and local AI" width="100%" />
+</p>
+
 # Cognolith
 
 Cognolith is a self-hosted knowledge workspace for connected notes, document ingestion, relationship graphs, hybrid search, and local AI chat. It runs on Next.js, FastAPI, PostgreSQL with pgvector, and optional Ollama models.

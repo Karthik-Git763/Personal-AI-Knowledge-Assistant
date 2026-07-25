@@ -19,6 +19,11 @@ export const metadata: Metadata = {
   title: "Cognolith",
   description: "Organize your notes, documents, and AI conversations in one place.",
   metadataBase: new URL(process.env.NEXT_PUBLIC_FRONTEND_URL || "http://localhost:8080"),
+  icons: {
+    icon: [{ url: "/favicon.png", type: "image/png" }],
+    shortcut: "/favicon.png",
+    apple: "/favicon.png",
+  },
 };
 
 export default function RootLayout({

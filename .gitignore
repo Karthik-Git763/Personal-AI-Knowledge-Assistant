@@ -77,7 +77,6 @@ uploads
 .ruff_cache
 
 node_modules/
-.docs
 docs
 
 # Local planning and backup runtime artifacts
