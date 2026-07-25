@@ -158,7 +158,7 @@ describe("GoogleDriveBackupSettingsView", () => {
       />
     );
 
-    expect(markup).toContain("Restore points temporarily unavailable");
+    expect(markup).toContain("Backup history temporarily unavailable");
     expect(markup).toContain("2 snapshots known");
     expect(markup).not.toContain("No cloud snapshots yet");
     const refreshButton = markup.match(

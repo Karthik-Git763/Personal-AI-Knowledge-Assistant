@@ -65,6 +65,7 @@ class BackupExporter:
             else settings.BACKUP_MAX_ARCHIVE_SIZE
         )
         self.app_version = app_version or settings.VERSION
+        self._required_note_ids_by_user: dict[int, set[int]] = {}
 
     def validate_source_path(self, source: Path) -> Path:
         return validate_archive_path(self.upload_root, source)
@@ -79,6 +80,7 @@ class BackupExporter:
         if user.id is None:
             raise ValueError("Backup exports require a persisted user")
 
+        self._required_note_ids_by_user[user.id] = self._calculate_required_note_ids(user.id)
         default_folder = self._default_preference_folder(user.id)
         archive_backup_id = backup_id or uuid4()
         created_at = datetime.now(UTC)
@@ -334,28 +336,47 @@ class BackupExporter:
     def _is_required_note(self, note: Notes, user_id: int) -> bool:
         if note.id is None:
             return False
-        references = self.session.exec(
-            select(Notes.id)
-            .where(
-                Notes.user_id == user_id,
-                col(Notes.is_deleted).is_(False),
-                (Notes.parent_note_id == note.id) | (Notes.previous_version_id == note.id),
+        required = self._required_note_ids_by_user.get(user_id)
+        if required is None:
+            required = self._calculate_required_note_ids(user_id)
+            self._required_note_ids_by_user[user_id] = required
+        return note.id in required
+
+    def _calculate_required_note_ids(self, user_id: int) -> set[int]:
+        notes = list(
+            self._iterate(
+                select(Notes).where(Notes.user_id == user_id).order_by(col(Notes.portable_id))
             )
-            .limit(1)
-        ).first()
-        if references is not None:
-            return True
-        statement = select(NoteLinks).where(
-            (NoteLinks.source_note_id == note.id) | (NoteLinks.target_note_id == note.id)
         )
-        for link in self._iterate(statement):
-            source = self._get(Notes, link.source_note_id, "link source note")
-            target = self._get(Notes, link.target_note_id, "link target note")
-            if source.user_id == user_id and not source.is_deleted:
-                return True
-            if target.user_id == user_id and not target.is_deleted:
-                return True
-        return False
+        notes_by_id = {note.id: note for note in notes if note.id is not None}
+        required = {identifier for identifier, note in notes_by_id.items() if not note.is_deleted}
+
+        for link in self._iterate(select(NoteLinks).order_by(col(NoteLinks.portable_id))):
+            source = notes_by_id.get(link.source_note_id)
+            target = notes_by_id.get(link.target_note_id)
+            if source is None and target is None:
+                continue
+            if source is None or target is None:
+                raise InvalidBackupReference("Backup note link belongs to another user")
+            if not source.is_deleted or not target.is_deleted:
+                required.update((link.source_note_id, link.target_note_id))
+
+        pending = list(required)
+        while pending:
+            note = notes_by_id[pending.pop()]
+            for relationship, target_id in (
+                ("parent", note.parent_note_id),
+                ("version", note.previous_version_id),
+            ):
+                if target_id is None or target_id in required:
+                    continue
+                if target_id not in notes_by_id:
+                    raise InvalidBackupReference(
+                        f"Backup note {relationship} belongs to another user"
+                    )
+                required.add(target_id)
+                pending.append(target_id)
+        return required
 
     def _is_required_folder(
         self,

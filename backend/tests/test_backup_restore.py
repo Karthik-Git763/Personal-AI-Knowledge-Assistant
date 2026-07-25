@@ -1466,6 +1466,14 @@ def coordinator_restore(
     store = CoordinatorStore(remote, archive)
     importer = CoordinatorImporter(session)
     exporter = CoordinatorExporter(now)
+    processed_document_ids: list[int] = []
+
+    async def process_document(
+        session: Session, user_id: int, document_id: int
+    ) -> None:
+        assert user_id == user.id
+        processed_document_ids.append(document_id)
+
     lock_session = Session(engine)
     coordinator = BackupCoordinator(
         session_factory=lambda: session,
@@ -1473,6 +1481,7 @@ def coordinator_restore(
         exporter_factory=lambda session: exporter,
         importer_factory=lambda session: importer,
         store_factory=lambda session, user, connection: store,
+        document_processor=process_document,
         clock=lambda: now,
         temporary_directory=tmp_path / "coordinator-temp",
         close_sessions=False,
@@ -1492,6 +1501,7 @@ def coordinator_restore(
             "archive_owner_id": archive_owner_id,
             "drive_owner_id": drive_owner_id,
             "session": session,
+            "processed_document_ids": processed_document_ids,
         }
     finally:
         lock_session.close()
@@ -1650,6 +1660,7 @@ async def test_restore_creates_verified_safety_backup_and_separate_operation(
     assert coordinator_restore["importer"].restore_backup_ids == [
         coordinator_restore["remote"].metadata.backup_id
     ]
+    assert coordinator_restore["processed_document_ids"] == [101]
 
 
 @pytest.mark.asyncio

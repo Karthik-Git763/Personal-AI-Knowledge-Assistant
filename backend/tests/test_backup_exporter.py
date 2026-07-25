@@ -31,6 +31,7 @@ from app.services.backup_archive import (
     VersionedZipWriter,
 )
 from app.services.backup_exporter import BackupExporter
+from app.services.backup_importer import BackupImporter
 
 
 @pytest.fixture
@@ -244,6 +245,42 @@ def test_export_includes_only_soft_deleted_notes_needed_by_live_links(
         exported_ids = {record["id"] for record in json.loads(archive.read("notes.json"))}
     assert str(linked_deleted_note.portable_id) in exported_ids
     assert str(unrelated_deleted_note.portable_id) not in exported_ids
+
+
+def test_export_includes_complete_deleted_note_version_chain(
+    populated_workspace: tuple[User, Path],
+    exporter: BackupExporter,
+    session: Session,
+    tmp_path: Path,
+) -> None:
+    user, upload_root = populated_workspace
+    oldest = Notes(user_id=user.id, title="Oldest", content="v1", is_deleted=True)
+    previous = Notes(user_id=user.id, title="Previous deleted", content="v2", is_deleted=True)
+    session.add_all([oldest, previous])
+    session.commit()
+    previous.previous_version_id = oldest.id
+    current = session.exec(
+        select(Notes).where(Notes.user_id == user.id, Notes.title == "Current")
+    ).one()
+    current.previous_version_id = previous.id
+    session.add_all([current, previous])
+    session.commit()
+
+    result = exporter.export(user, tmp_path / "version-chain.zip")
+
+    with ZipFile(result.path) as archive:
+        exported_ids = {record["id"] for record in json.loads(archive.read("notes.json"))}
+    assert {
+        str(current.portable_id),
+        str(previous.portable_id),
+        str(oldest.portable_id),
+    } <= exported_ids
+    preview = BackupImporter(
+        session=session,
+        upload_root=upload_root,
+        supported_app_versions={exporter.app_version},
+    ).preview(result.path, expected_workspace_owner_id=user.portable_id)
+    assert preview.item_counts["notes"] == len(exported_ids)
 
 
 def test_export_includes_deleted_ancestor_chain_for_exported_folder(

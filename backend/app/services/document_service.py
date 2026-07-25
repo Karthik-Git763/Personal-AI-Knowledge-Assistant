@@ -3,10 +3,11 @@ from __future__ import annotations
 import hashlib
 import logging
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import HTTPException, UploadFile
-from sqlalchemy import func
+from sqlalchemy import delete, func
 from sqlmodel import Session, col, or_, select
 
 from app.ai.document_summary import generate_document_summary
@@ -47,6 +48,7 @@ def _mark_document_failed(*, session: Session, document_id: int | None, reason: 
 
         document.status = "failed"
         document.processing_error = reason
+        document.processing_completed_at = datetime.now(UTC)
         session.add(document)
         session.commit()
     except Exception:
@@ -90,17 +92,60 @@ async def upload_and_process_document(
     session.refresh(document)
 
     try:
-        content = clean_text(extract_text_from_file(saved_path))
-        chunks = split_text_into_chunks(content)
+        if document.id is None:
+            raise RuntimeError("Uploaded document was not persisted")
+        return await process_existing_document(
+            session=session,
+            user_id=current_user.id,
+            document_id=document.id,
+        )
+    except HTTPException:
+        _remove_uploaded_file(saved_path)
+        raise
+    except Exception:
+        logger.exception(
+            "Document processing failed",
+            extra={"document_id": document.id, "user_id": current_user.id},
+        )
+        _remove_uploaded_file(saved_path)
+        raise HTTPException(status_code=500, detail="Failed to process document")
 
+
+async def process_existing_document(
+    session: Session,
+    user_id: int,
+    document_id: int,
+) -> Document:
+    document = session.get(Document, document_id)
+    if document is None or document.user_id != user_id:
+        raise ValueError("Document is unavailable for processing")
+    if document.is_deleted:
+        raise ValueError("Deleted documents cannot be processed")
+
+    document.status = "processing"
+    document.processing_started_at = datetime.now(UTC)
+    document.processing_completed_at = None
+    document.processing_error = None
+    document.content = None
+    document.content_preview = None
+    document.summary = None
+    document.keywords = []
+    document.word_count = None
+    document.page_count = None
+    document.chunk_count = 0
+    session.exec(delete(DocumentChunks).where(col(DocumentChunks.document_id) == document_id))
+    session.add(document)
+    session.commit()
+
+    try:
+        content = clean_text(extract_text_from_file(document.file_path))
+        chunks = split_text_into_chunks(content)
         document.content = content
         document.content_preview = create_content_preview(content)
         document.word_count = len(content.split()) if content else 0
         document.chunk_count = len(chunks)
-        document.status = "completed"
 
         chunk_rows: list[DocumentChunks] = []
-
         for index, chunk_content in enumerate(chunks):
             chunk_row = DocumentChunks(
                 document_id=document.id,
@@ -113,67 +158,59 @@ async def upload_and_process_document(
             )
             session.add(chunk_row)
             chunk_rows.append(chunk_row)
-
         session.flush()
 
         if chunk_rows:
             try:
                 embeddings, embedding_model = await generate_embeddings(
                     session=session,
-                    user_id=current_user.id,
+                    user_id=user_id,
                     texts=[chunk.content for chunk in chunk_rows],
                 )
-                vector_store = PgVectorStore(session=session)
-                vector_store.store_document_chunk_embeddings(
+                PgVectorStore(session=session).store_document_chunk_embeddings(
                     chunks=chunk_rows,
                     embeddings=embeddings,
-                    user_id=current_user.id,
+                    user_id=user_id,
                     model=embedding_model,
                 )
-            except Exception as e:
-                logger.warning(
-                    f"Failed to generate embeddings: {str(e)}. Document stored without embeddings."
+            except Exception:
+                logger.exception(
+                    "Failed to generate document embeddings; content remains available",
+                    extra={"document_id": document.id, "user_id": user_id},
                 )
 
         if content:
             try:
                 document.summary = await generate_document_summary(
                     session=session,
-                    user_id=current_user.id,
+                    user_id=user_id,
                     title=document.title,
                     content=content,
                 )
             except Exception:
                 document.summary = None
                 logger.exception(
-                    "Failed to generate document summary; upload will remain available",
-                    extra={"document_id": document.id, "user_id": current_user.id},
+                    "Failed to generate document summary; content remains available",
+                    extra={"document_id": document.id, "user_id": user_id},
                 )
 
+        document.status = "completed"
+        document.processing_completed_at = datetime.now(UTC)
         session.add(document)
         session.commit()
         session.refresh(document)
         return document
-    except HTTPException:
-        _remove_uploaded_file(saved_path)
-        _mark_document_failed(
-            session=session,
-            document_id=document.id,
-            reason="Failed to process file",
-        )
-        raise
     except Exception:
         logger.exception(
             "Document processing failed",
-            extra={"document_id": document.id, "user_id": current_user.id},
+            extra={"document_id": document_id, "user_id": user_id},
         )
-        _remove_uploaded_file(saved_path)
         _mark_document_failed(
             session=session,
-            document_id=document.id,
+            document_id=document_id,
             reason="Unexpected server error during document processing",
         )
-        raise HTTPException(status_code=500, detail="Failed to process document")
+        raise
 
 
 async def _validate_and_prepare(file: UploadFile) -> None:

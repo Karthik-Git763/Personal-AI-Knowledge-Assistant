@@ -174,7 +174,10 @@ def test_backup_routes_apply_csrf_protection(session) -> None:
     assert response.status_code == 403
 
 
-def test_status_reports_unconfigured_deployment(session) -> None:
+def test_status_reports_unconfigured_deployment(session, monkeypatch) -> None:
+    monkeypatch.setattr(settings, "GOOGLE_DRIVE_CLIENT_ID", None)
+    monkeypatch.setattr(settings, "GOOGLE_DRIVE_CLIENT_SECRET", None)
+    monkeypatch.setattr(settings, "GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY", None)
     client, _ = _authenticated_client(session)
 
     try:

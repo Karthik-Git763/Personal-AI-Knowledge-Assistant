@@ -1263,7 +1263,9 @@ class BackupImporter:
         self._insert_preferences(user_id, records["user_preferences"], folders)
         self.session.flush()
         return sorted(
-            document.id for document in documents.values() if document.id is not None
+            document.id
+            for document in documents.values()
+            if document.id is not None and not document.is_deleted
         )
 
     def _insert_folders(
@@ -1352,7 +1354,7 @@ class BackupImporter:
                 keywords=[],
                 tags=record["tags"],
                 language=record["language"],
-                status="processing",
+                status="deleted" if record["is_deleted"] else "processing",
                 processing_started_at=None,
                 processing_completed_at=None,
                 processing_error=None,

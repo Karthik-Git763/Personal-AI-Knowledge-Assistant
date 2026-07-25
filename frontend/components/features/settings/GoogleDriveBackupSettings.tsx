@@ -292,10 +292,10 @@ export function GoogleDriveBackupSettingsView({
               <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border pb-3">
                 <div>
                   <h3 id="restore-points-heading" className="text-sm font-semibold text-foreground">
-                    Restore points
+                    Backup history
                   </h3>
                   <p className="text-xs text-muted-foreground">
-                    Restoring replaces the current workspace after a safety backup.
+                    Restoring first creates a safety backup of your current workspace.
                   </p>
                 </div>
                 <span className="text-xs text-muted-foreground">
@@ -309,7 +309,7 @@ export function GoogleDriveBackupSettingsView({
                 <div className="flex min-h-28 flex-col items-center justify-center gap-2 text-center">
                   <AlertTriangle className="h-5 w-5 text-muted-foreground" />
                   <p className="text-sm font-medium text-foreground">
-                    Restore points temporarily unavailable
+                    Backup history temporarily unavailable
                   </p>
                   <p className="text-xs text-muted-foreground">
                     Refresh when Google Drive is available again.

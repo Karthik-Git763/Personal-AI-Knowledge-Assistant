@@ -322,8 +322,9 @@ class GoogleDriveStore:
         parents = raw_file.get("parents")
         if (
             not isinstance(parents, list)
-            or not all(isinstance(parent, str) for parent in parents)
-            or "appDataFolder" not in parents
+            or len(parents) != 1
+            or not isinstance(parents[0], str)
+            or not parents[0]
         ):
             raise GoogleDriveMalformedPayloadError("Google Drive file parent is invalid")
         backup = StoredBackup(

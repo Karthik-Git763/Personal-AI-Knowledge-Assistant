@@ -122,7 +122,7 @@ def _drive_file(
         "name": f"cognolith-{metadata.backup_id}.zip",
         "size": str(len(ARCHIVE_BYTES)),
         "createdTime": server_created_at.isoformat().replace("+00:00", "Z"),
-        "parents": parents if parents is not None else ["appDataFolder"],
+        "parents": parents if parents is not None else ["app_data_folder_id_12345"],
         "appProperties": app_properties,
     }
 
@@ -402,7 +402,7 @@ async def test_different_google_subject_cannot_list_prior_snapshot(
 
 
 @pytest.mark.asyncio
-async def test_list_rejects_backups_without_appdatafolder_parent(
+async def test_list_accepts_concrete_appdatafolder_parent_id(
     session: Session, configured_token_encryption: Settings
 ) -> None:
     metadata: BackupObjectMetadata | None = None
@@ -411,7 +411,32 @@ async def test_list_rejects_backups_without_appdatafolder_parent(
         if request.url == GoogleDriveOAuthService.TOKEN_URL:
             return _token_response(request)
         assert metadata is not None
-        return httpx.Response(200, json={"files": [_drive_file(metadata, parents=["root"])]})
+        assert request.url.params["spaces"] == "appDataFolder"
+        return httpx.Response(
+            200,
+            json={"files": [_drive_file(metadata, parents=["app_data_folder_id_12345"])]},
+        )
+
+    store, owner_id = await _store(session, configured_token_encryption, handler)
+    metadata = _metadata(owner_id)
+    try:
+        backups = await store.list(owner_id)
+        assert backups == [_stored_backup(metadata)]
+    finally:
+        await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_list_rejects_missing_parent_id(
+    session: Session, configured_token_encryption: Settings
+) -> None:
+    metadata: BackupObjectMetadata | None = None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url == GoogleDriveOAuthService.TOKEN_URL:
+            return _token_response(request)
+        assert metadata is not None
+        return httpx.Response(200, json={"files": [_drive_file(metadata, parents=[])]})
 
     store, owner_id = await _store(session, configured_token_encryption, handler)
     metadata = _metadata(owner_id)
