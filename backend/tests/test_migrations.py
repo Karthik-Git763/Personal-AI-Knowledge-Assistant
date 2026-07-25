@@ -267,7 +267,7 @@ def test_google_drive_subject_migration_rejects_existing_duplicates() -> None:
                 },
             )
 
-    with pytest.raises(RuntimeError, match="duplicate Google subjects"):
+    with pytest.raises(RuntimeError, match="duplicate active Google subjects"):
         command.upgrade(config, "head")
 
     with engine.connect() as connection:
@@ -277,4 +277,12 @@ def test_google_drive_subject_migration_rejects_existing_duplicates() -> None:
             ).scalar_one()
             == "0005_google_drive_backup_foundation"
         )
-    command.downgrade(config, "0004_streaming_chat")
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM google_drive_connections"))
+        connection.execute(
+            text(
+                "DELETE FROM users WHERE email IN "
+                "('first-owner@example.com', 'second-owner@example.com')"
+            )
+        )
+    command.upgrade(config, "head")

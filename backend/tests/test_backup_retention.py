@@ -2,7 +2,6 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
-from tests.fakes.fake_backup_store import FakeBackupStore
 
 from app.services.backup_store import (
     BackupCleanupError,
@@ -10,6 +9,7 @@ from app.services.backup_store import (
     StoredBackup,
     prune_successful_backups,
 )
+from tests.fakes.fake_backup_store import FakeBackupStore
 
 
 @pytest.mark.asyncio

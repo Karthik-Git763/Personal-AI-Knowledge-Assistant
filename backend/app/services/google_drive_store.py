@@ -309,6 +309,10 @@ class GoogleDriveStore:
         if not raw_size.isdecimal():
             raise GoogleDriveMalformedPayloadError("Google Drive file size is invalid")
         parsed_size = int(raw_size)
+        if parsed_size > self.settings.BACKUP_MAX_ARCHIVE_SIZE:
+            raise GoogleDriveMalformedPayloadError(
+                "Google Drive backup exceeds the configured maximum size"
+            )
         properties = raw_file.get("appProperties")
         if not isinstance(properties, Mapping):
             raise GoogleDriveMalformedPayloadError("Google Drive file properties are invalid")

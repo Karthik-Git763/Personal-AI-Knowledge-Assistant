@@ -215,7 +215,15 @@ async def _trusted_remote_backups(
     try:
         owner_id = derive_drive_owner_id(connection.google_subject)
         remote_backups = await store.list(owner_id)
-        return [backup for backup in remote_backups if is_valid_stored_backup(backup, owner_id)]
+        return [
+            backup
+            for backup in remote_backups
+            if is_valid_stored_backup(
+                backup,
+                owner_id,
+                settings.BACKUP_MAX_ARCHIVE_SIZE,
+            )
+        ]
     except Exception as error:
         raise _map_drive_error(error) from error
     finally:
@@ -245,7 +253,11 @@ def _adopt_remote_backups(
     trusted = [
         remote
         for remote in remote_backups
-        if is_valid_stored_backup(remote, drive_owner_id)
+        if is_valid_stored_backup(
+            remote,
+            drive_owner_id,
+            settings.BACKUP_MAX_ARCHIVE_SIZE,
+        )
     ]
     if not trusted:
         return {}
@@ -298,6 +310,7 @@ def _restore_eligible(backup: WorkspaceBackup, remote: StoredBackup) -> bool:
         and backup.backup_id == remote.metadata.backup_id
         and backup.remote_file_id == remote.remote_id
         and remote.size >= MINIMUM_BACKUP_ARCHIVE_SIZE
+        and remote.size <= settings.BACKUP_MAX_ARCHIVE_SIZE
         and backup.schema_version in _SUPPORTED_RESTORE_SCHEMA_VERSIONS
         and remote.completed
         and remote.metadata.schema_version == backup.schema_version

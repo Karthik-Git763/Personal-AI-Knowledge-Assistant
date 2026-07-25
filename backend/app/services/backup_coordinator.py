@@ -565,7 +565,12 @@ class BackupCoordinator:
         )
         if (
             stored is None
-            or not is_valid_stored_backup(stored, drive_owner_id)
+            or not is_valid_stored_backup(
+                stored,
+                drive_owner_id,
+                settings.BACKUP_MAX_ARCHIVE_SIZE,
+            )
+            or stored.metadata.backup_id != source.backup_id
             or stored.metadata.archive_checksum != source.checksum
             or stored.metadata.schema_version != source.schema_version
             or (

@@ -391,11 +391,16 @@ def restore_workspace(
     archive = _write_restore_archive(
         tmp_path / "restore.zip", archive_owner_id, records
     )
+    with ZipFile(archive) as source:
+        archive_backup_id = UUID(
+            json.loads(source.read("manifest.json"))["backup_id"]
+        )
     return {
         "user": user,
         "other_user": other_user,
         "archive": archive,
         "archive_owner_id": archive_owner_id,
+        "archive_backup_id": archive_backup_id,
         "identifiers": identifiers,
         "upload_root": upload_root,
         "temp_root": tmp_path / "backup-temp",
@@ -1440,6 +1445,7 @@ def coordinator_restore(
     )
     session.add_all([connection, schedule, source, other_source])
     session.commit()
+    assert source.backup_id is not None
     archive_owner_id = uuid4()
     drive_owner_id = derive_drive_owner_id(connection.google_subject)
     remote = StoredBackup(
@@ -1450,7 +1456,7 @@ def coordinator_restore(
         metadata=BackupObjectMetadata(
             drive_owner_id=drive_owner_id,
             workspace_owner_id=archive_owner_id,
-            backup_id=uuid4(),
+            backup_id=source.backup_id,
             schema_version=1,
             archive_checksum=checksum,
             created_at=now,
@@ -1731,6 +1737,7 @@ async def test_restore_commit_failure_rolls_back_workspace_and_marks_operation_f
     archive: Path = restore_workspace["archive"]
     checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
     source = WorkspaceBackup(
+        backup_id=restore_workspace["archive_backup_id"],
         user_id=user.id,
         status=BackupStatus.completed,
         trigger=BackupTrigger.manual,

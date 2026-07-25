@@ -45,6 +45,7 @@ import {
   type WorkspaceBackup,
 } from "@/lib/api/backups";
 import {
+  applyTerminalBackupOperation,
   loadBackupSettingsData,
   pollBackupOperation,
 } from "@/lib/api/backupLifecycle";
@@ -133,6 +134,7 @@ interface GoogleDriveBackupSettingsViewProps {
   actionPending?: boolean;
   error?: string | null;
   message?: string | null;
+  listUnavailable?: boolean;
   onBackup: () => void;
   onConnect: () => void;
   onDeleteBackups: () => void;
@@ -147,6 +149,7 @@ export function GoogleDriveBackupSettingsView({
   actionPending = false,
   error = null,
   message = null,
+  listUnavailable = false,
   onBackup,
   onConnect,
   onDeleteBackups,
@@ -250,7 +253,7 @@ export function GoogleDriveBackupSettingsView({
               </div>
             </div>
 
-            {status.active_operation ? (
+            {active && status.active_operation ? (
               <div
                 className="flex flex-wrap items-center justify-between gap-3 border border-border bg-muted/40 p-3"
                 aria-live="polite"
@@ -295,10 +298,24 @@ export function GoogleDriveBackupSettingsView({
                     Restoring replaces the current workspace after a safety backup.
                   </p>
                 </div>
-                <span className="text-xs text-muted-foreground">{backups.length} available</span>
+                <span className="text-xs text-muted-foreground">
+                  {listUnavailable && status.restore_points.length > 0
+                    ? `${status.restore_points.length} snapshots known`
+                    : `${backups.length} available`}
+                </span>
               </div>
 
-              {backups.length === 0 ? (
+              {listUnavailable && backups.length === 0 && status.restore_points.length > 0 ? (
+                <div className="flex min-h-28 flex-col items-center justify-center gap-2 text-center">
+                  <AlertTriangle className="h-5 w-5 text-muted-foreground" />
+                  <p className="text-sm font-medium text-foreground">
+                    Restore points temporarily unavailable
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    Refresh when Google Drive is available again.
+                  </p>
+                </div>
+              ) : backups.length === 0 ? (
                 <div className="flex min-h-28 flex-col items-center justify-center gap-2 text-center">
                   <DatabaseBackup className="h-5 w-5 text-muted-foreground" />
                   <p className="text-sm font-medium text-foreground">No cloud snapshots yet</p>
@@ -554,6 +571,7 @@ export function GoogleDriveBackupSettings() {
         );
       },
       onTerminal: (operation) => {
+        setStatus((current) => applyTerminalBackupOperation(current, operation));
         setMessage(
           operation.status === "completed"
             ? operation.operation_kind === "restore"
@@ -663,6 +681,7 @@ export function GoogleDriveBackupSettings() {
           actionPending={isActionPending}
           error={error}
           message={message}
+          listUnavailable={Boolean(error) && status.connection_status === "connected"}
           onBackup={() => void beginBackup()}
           onConnect={() => void beginConnect()}
           onDeleteBackups={() => setConfirmationKind("delete")}

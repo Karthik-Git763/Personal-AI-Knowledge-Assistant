@@ -8,7 +8,7 @@ from uuid import UUID, uuid5
 
 import httpx
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import Session, select
+from sqlmodel import Session, col, select
 
 from app.core.config import Settings
 from app.core.config import settings as default_settings
@@ -148,6 +148,12 @@ class GoogleDriveOAuthService:
             select(GoogleDriveConnection).where(
                 GoogleDriveConnection.google_subject == google_subject,
                 GoogleDriveConnection.user_id != user_id,
+                col(GoogleDriveConnection.status).in_(
+                    [
+                        DriveConnectionStatus.connected,
+                        DriveConnectionStatus.reauthorization_required,
+                    ]
+                ),
             )
         ).first()
         if subject_owner is not None:

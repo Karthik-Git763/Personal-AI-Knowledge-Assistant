@@ -48,7 +48,7 @@ jobs:
           .venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
       - run: .venv/bin/ruff check backend
       - run: .venv/bin/basedpyright backend
-      - run: ../.venv/bin/pytest -q
+      - run: ../.venv/bin/python -m pytest -q tests
         working-directory: backend
       - run: .venv/bin/pip-audit -r requirements.txt
 

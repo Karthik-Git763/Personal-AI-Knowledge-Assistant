@@ -3,7 +3,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, LargeBinary, String
+from sqlalchemy import DateTime, LargeBinary, String, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlmodel import Column, Field, Index, Relationship, SQLModel
@@ -47,7 +47,17 @@ class DriveConnectionStatus(StrEnum):
 
 class GoogleDriveConnection(TimestampMixin, SQLModel, table=True):
     __tablename__: ClassVar[str] = "google_drive_connections"  # pyright: ignore
-    __table_args__ = (Index("ix_google_drive_connections_user_status", "user_id", "status"),)
+    __table_args__ = (
+        Index("ix_google_drive_connections_user_status", "user_id", "status"),
+        Index(
+            "ix_google_drive_connections_google_subject",
+            "google_subject",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('connected', 'reauthorization_required')"
+            ),
+        ),
+    )
 
     id: int | None = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="users.id", nullable=False, unique=True, index=True)
@@ -55,12 +65,7 @@ class GoogleDriveConnection(TimestampMixin, SQLModel, table=True):
     token_expires_at: datetime | None = Field(
         default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
     )
-    google_subject: str = Field(
-        nullable=False,
-        max_length=255,
-        unique=True,
-        index=True,
-    )
+    google_subject: str = Field(nullable=False, max_length=255)
     google_email: str = Field(nullable=False, max_length=255)
     granted_scopes: list[str] = Field(default_factory=list, sa_column=Column(JSONB, nullable=False))
     status: DriveConnectionStatus = Field(

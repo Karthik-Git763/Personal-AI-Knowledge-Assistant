@@ -69,9 +69,9 @@ export function RestoreConfirmationContent({
       <div className="flex flex-col gap-1.5">
         <div className="flex items-center gap-2">
           <DatabaseBackup className="h-4 w-4 text-muted-foreground" />
-          <h2 className="font-heading text-base font-medium text-foreground">
+          <div className="font-heading text-base font-medium text-foreground">
             Replace workspace from backup
-          </h2>
+          </div>
         </div>
         <p className="text-sm text-muted-foreground">
           This restores the selected snapshot and replaces the current workspace after creating a

@@ -53,11 +53,16 @@ class BackupCleanupError(RuntimeError):
 _CHECKSUM = re.compile(r"[0-9a-f]{64}")
 
 
-def is_valid_stored_backup(backup: StoredBackup, drive_owner_id: UUID) -> bool:
+def is_valid_stored_backup(
+    backup: StoredBackup,
+    drive_owner_id: UUID,
+    max_archive_size: int = 2_147_483_647,
+) -> bool:
     return (
         is_trusted_stored_backup(backup, drive_owner_id)
         and backup.completed
         and backup.size >= MINIMUM_BACKUP_ARCHIVE_SIZE
+        and backup.size <= max_archive_size
     )
 
 

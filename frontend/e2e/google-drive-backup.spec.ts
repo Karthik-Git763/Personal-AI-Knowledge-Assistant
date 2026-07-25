@@ -12,6 +12,7 @@ interface MockBackup {
   status: OperationStatus;
   trigger: "manual";
   schema_version: number;
+  app_version: string;
   archive_size_bytes: number;
   item_counts: Record<string, number>;
   started_at: string;
@@ -33,6 +34,7 @@ const initialSnapshots: MockBackup[] = Array.from({ length: 4 }, (_, index) => {
     status: "completed",
     trigger: "manual",
     schema_version: 1,
+    app_version: "0.1.0",
     archive_size_bytes: 2048 + index * 1024,
     item_counts: {
       notes: 12 + index,
@@ -59,6 +61,7 @@ function operation(
     status,
     trigger: "manual",
     schema_version: 1,
+    app_version: "0.1.0",
     archive_size_bytes: status === "completed" ? 8192 : 0,
     item_counts: status === "completed" ? { notes: 16, documents: 3, chat_sessions: 2 } : {},
     started_at: "2026-07-24T09:00:00Z",
@@ -189,16 +192,17 @@ test("connects Drive, backs up, restores, and disconnects", async ({ page, reque
   page.on("pageerror", (error) => browserErrors.push(`page: ${error.message}`));
 
   await registerAndVerify(page, request, `drive-backup-${Date.now()}@example.com`);
+  browserErrors.length = 0;
   const polls = await installBackupApi(page);
 
   await page.goto("/dashboard/settings");
-  await expect(page.getByRole("heading", { name: "Google Drive backup" })).toBeVisible();
+  await expect(page.getByText("Google Drive backup", { exact: true })).toBeVisible();
   await expect(page.getByText("Not connected", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Connect Google Drive" })).toBeVisible();
 
   await page.getByRole("button", { name: "Dark", exact: true }).click();
   await expect(page.locator("html")).toHaveClass(/dark/);
-  await expect(page.getByRole("heading", { name: "Google Drive backup" })).toBeVisible();
+  await expect(page.getByText("Google Drive backup", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Connect Google Drive" })).toBeVisible();
 
   await page.getByRole("button", { name: "Connect Google Drive" }).click();
@@ -206,6 +210,7 @@ test("connects Drive, backs up, restores, and disconnects", async ({ page, reque
   await expect(page.getByText("Google Drive is connected. Daily backups are now enabled.")).toBeVisible();
   await expect(page.getByText(googleEmail, { exact: true })).toBeVisible();
   await expect(page.getByText("4 available", { exact: true })).toBeVisible();
+  await expect(page.getByText("App 0.1.0", { exact: true }).first()).toBeVisible();
 
   await page.getByRole("button", { name: "Back up now" }).click();
   await expect(page.getByText("Preparing backup", { exact: true })).toBeVisible();

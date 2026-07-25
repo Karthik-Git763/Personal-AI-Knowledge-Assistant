@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { GoogleDriveBackupStatus, WorkspaceBackup } from "../backups";
 import {
+  applyTerminalBackupOperation,
   loadBackupSettingsData,
   pollBackupOperation,
 } from "../backupLifecycle";
@@ -97,5 +98,25 @@ describe("loadBackupSettingsData", () => {
     expect(result.backups).toEqual([previousBackup]);
     expect(result.statusError).toBeNull();
     expect(result.listError).toBe(listError);
+  });
+
+  it("preserves a terminal operation when the following status refresh fails", async () => {
+    const failedOperation: WorkspaceBackup = {
+      ...activeOperation,
+      status: "failed",
+      failure_message: "Backup failed.",
+    };
+    const terminalStatus = applyTerminalBackupOperation(connectedStatus, failedOperation);
+
+    const result = await loadBackupSettingsData({
+      getStatus: async () => Promise.reject(new Error("status unavailable")),
+      listBackups: async () => [],
+      previousStatus: terminalStatus,
+      previousBackups: [],
+    });
+
+    expect(result.status?.active_operation).toEqual(failedOperation);
+    expect(result.status?.active_operation?.status).toBe("failed");
+    expect(result.statusError).toBeInstanceOf(Error);
   });
 });

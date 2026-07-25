@@ -28,6 +28,7 @@ from app.core import security
 from app.core.config import settings
 from app.core.database import engine
 from app.main import app
+from app.models.backup import BackupSchedule, GoogleDriveConnection, WorkspaceBackup
 from app.models.user import RefreshToken, TokenBlacklist, User, UserCreate
 from app.services import auth_service
 
@@ -41,6 +42,9 @@ def db_session():
         # Clean up existing test data
         session.exec(delete(TokenBlacklist))
         session.exec(delete(RefreshToken))
+        session.exec(delete(WorkspaceBackup))
+        session.exec(delete(BackupSchedule))
+        session.exec(delete(GoogleDriveConnection))
         session.exec(delete(User))
         session.commit()
         yield session

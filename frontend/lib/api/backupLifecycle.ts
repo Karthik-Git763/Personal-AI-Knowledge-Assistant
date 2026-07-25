@@ -103,6 +103,13 @@ export interface BackupSettingsLoadResult {
   listError: unknown | null;
 }
 
+export function applyTerminalBackupOperation(
+  status: GoogleDriveBackupStatus | null,
+  operation: WorkspaceBackup
+): GoogleDriveBackupStatus | null {
+  return status ? { ...status, active_operation: operation } : null;
+}
+
 export async function loadBackupSettingsData({
   getStatus,
   listBackups,

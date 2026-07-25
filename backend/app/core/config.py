@@ -4,7 +4,15 @@ import warnings
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self
 
-from pydantic import AnyUrl, BeforeValidator, EmailStr, PostgresDsn, computed_field, model_validator
+from pydantic import (
+    AnyUrl,
+    BeforeValidator,
+    EmailStr,
+    Field,
+    PostgresDsn,
+    computed_field,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -185,9 +193,13 @@ class Settings(BaseSettings):
     GOOGLE_DRIVE_CLIENT_SECRET: str | None = None
     GOOGLE_DRIVE_REDIRECT_URI: str = "http://localhost:3000/api/v1/users/me/google-drive/callback"
     GOOGLE_DRIVE_TOKEN_ENCRYPTION_KEY: str | None = None
-    BACKUP_INTERVAL_HOURS: int = 24
-    BACKUP_RETENTION_COUNT: int = 5
-    BACKUP_MAX_ARCHIVE_SIZE: int = 1_073_741_824
+    BACKUP_INTERVAL_HOURS: int = Field(default=24, ge=1)
+    BACKUP_RETENTION_COUNT: int = Field(default=5, ge=1)
+    BACKUP_MAX_ARCHIVE_SIZE: int = Field(
+        default=1_073_741_824,
+        ge=22,
+        le=2_147_483_647,
+    )
     BACKUP_TEMP_DIR: Path = Path("./backup-temp")
 
     @computed_field

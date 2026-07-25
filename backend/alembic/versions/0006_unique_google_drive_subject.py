@@ -24,6 +24,7 @@ def upgrade() -> None:
             """
             SELECT 1
             FROM google_drive_connections
+            WHERE status IN ('connected', 'reauthorization_required')
             GROUP BY google_subject
             HAVING count(*) > 1
             LIMIT 1
@@ -33,7 +34,7 @@ def upgrade() -> None:
     if duplicate is not None:
         raise RuntimeError(
             "Cannot enforce Google Drive account ownership because duplicate "
-            "Google subjects exist. Disconnect or remove duplicate local Drive "
+            "active Google subjects exist. Disconnect or remove duplicate local Drive "
             "connections, then rerun the migration."
         )
     op.create_index(
@@ -41,6 +42,9 @@ def upgrade() -> None:
         "google_drive_connections",
         ["google_subject"],
         unique=True,
+        postgresql_where=sa.text(
+            "status IN ('connected', 'reauthorization_required')"
+        ),
     )
 
 

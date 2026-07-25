@@ -107,6 +107,66 @@ describe("GoogleDriveBackupSettingsView", () => {
     expect(refreshButton).toBeDefined();
     expect(refreshButton).not.toContain('disabled=""');
   });
+
+  it("unlocks controls when the recorded operation is terminal", () => {
+    const markup = renderToStaticMarkup(
+      <GoogleDriveBackupSettingsView
+        status={{
+          ...idleStatus,
+          active_operation: {
+            ...snapshot,
+            status: "failed",
+            failure_message: "Backup failed.",
+          },
+        }}
+        backups={[snapshot]}
+        {...actions}
+      />
+    );
+
+    const backupButton = markup.match(/<button[^>]*>[\s\S]*?Back up now<\/button>/)?.[0];
+    expect(markup).toContain("Next backup");
+    expect(backupButton).toBeDefined();
+    expect(backupButton).not.toContain('disabled=""');
+  });
+
+  it("shows known restore points as unavailable when list loading fails", () => {
+    const markup = renderToStaticMarkup(
+      <GoogleDriveBackupSettingsView
+        status={{
+          ...idleStatus,
+          restore_points: [
+            {
+              backup_id: snapshot.backup_id,
+              schema_version: 1,
+              archive_size_bytes: 4096,
+              created_at: "2026-07-25T08:01:00Z",
+              restore_eligible: true,
+            },
+            {
+              backup_id: "1bb939b8-2a5d-47a1-83ab-b99598bd1077",
+              schema_version: 1,
+              archive_size_bytes: 8192,
+              created_at: "2026-07-24T08:01:00Z",
+              restore_eligible: true,
+            },
+          ],
+        }}
+        backups={[]}
+        listUnavailable
+        {...actions}
+      />
+    );
+
+    expect(markup).toContain("Restore points temporarily unavailable");
+    expect(markup).toContain("2 snapshots known");
+    expect(markup).not.toContain("No cloud snapshots yet");
+    const refreshButton = markup.match(
+      /<button[^>]*aria-label="Refresh backup status"[^>]*>[\s\S]*?Refresh<\/button>/
+    )?.[0];
+    expect(refreshButton).toBeDefined();
+    expect(refreshButton).not.toContain('disabled=""');
+  });
 });
 
 describe("restore confirmation", () => {
