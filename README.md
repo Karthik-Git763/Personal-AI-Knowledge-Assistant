@@ -312,6 +312,19 @@ docker compose --profile ai ps
 curl http://localhost:3000/health/ready
 ```
 
+Audit the pinned production dependencies with the same thresholds used by CI:
+
+```bash
+pnpm audit --prod --audit-level high
+docker compose exec backend pip-audit -r /usr/src/app/requirements.txt
+```
+
+Frontend audit fixes must update both `frontend/package.json` and
+`pnpm-lock.yaml`. Run `pnpm install` from the repository root after changing
+dependency versions or workspace overrides, then commit the regenerated
+lockfile. Keep audit tooling in development dependencies so it is not installed
+in production images.
+
 ## Continuous Integration
 
 Pull requests and pushes run three validation layers:
@@ -397,6 +410,8 @@ flowchart LR
         Search["Hybrid search"]
         Chat["RAG chat orchestration"]
         Graph["Knowledge graph relationships"]
+        Backups["Backup export, validation, and restore"]
+        Reprocessing["Document extraction and embedding rebuild"]
         Migrations --> FastAPI
         FastAPI --> Auth --> Services
         Services --> Notes
@@ -404,6 +419,8 @@ flowchart LR
         Services --> Search
         Services --> Chat
         Services --> Graph
+        Services --> Backups
+        Backups --> Reprocessing --> Documents
     end
 
     subgraph Database["PostgreSQL + pgvector :5432"]
@@ -412,11 +429,18 @@ flowchart LR
         FullText["Full-text indexes"]
         Vectors["Document and note embeddings"]
         OTP["Hashed email OTP records"]
+        BackupState["Encrypted Drive tokens, schedules, and operations"]
     end
 
     subgraph AI["Optional Ollama :11434"]
         ChatModel["Per-user chat model"]
         EmbedModel["Embedding model"]
+    end
+
+    subgraph Google["Google OAuth and Drive API"]
+        OAuth["Scoped OAuth authorization"]
+        AppData["Hidden appDataFolder snapshots"]
+        OAuth --> AppData
     end
 
     SMTP["SMTP or Mailpit :8025"]
@@ -426,6 +450,10 @@ flowchart LR
     APIClient -->|"Docker network"| FastAPI
     Auth --> OTP
     Auth -->|"Verification email"| SMTP
+    Backups --> BackupState
+    Backups -->|"Scoped OAuth and snapshot upload"| OAuth
+    Backups -->|"Export and restore originals"| Files
+    AppData -->|"Verified snapshot download"| Backups
     Notes --> Core
     Notes --> Links
     Documents --> Files
@@ -442,7 +470,7 @@ flowchart LR
 
 The browser communicates with the Next.js application on port `8080`. API calls go through the `/api/v1` rewrite to FastAPI on port `3000`, where authentication, CSRF checks, email verification, and account ownership are enforced before any workspace data is touched.
 
-PostgreSQL stores users, sessions, notes, document metadata, chat history, graph links, full-text indexes, and pgvector embeddings. Uploaded files live on the application filesystem. Alembic runs before the backend starts so schema changes are versioned instead of inferred at runtime. Ollama is optional: Cognolith can run without local AI, while chat, semantic search, summaries, and embeddings become richer when the configured models are available.
+PostgreSQL stores users, sessions, notes, document metadata, chat history, graph links, full-text indexes, pgvector embeddings, encrypted Google refresh tokens, backup schedules, and operation history. Uploaded files live on the application filesystem. Google Drive snapshots are checksum-validated ZIP archives stored in the connected account's hidden application-data folder. Restore replaces the workspace from a verified snapshot, then rebuilds derived document text, chunks, summaries, and embeddings. Alembic runs before the backend starts so schema changes are versioned instead of inferred at runtime. Ollama is optional: Cognolith can run without local AI, while chat, semantic search, summaries, and embeddings become richer when the configured models are available.
 
 Key directories:
 
